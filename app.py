@@ -22,7 +22,25 @@ def _trouver_police():
         if os.path.exists(c): return c
     return None
 
-POLICE_BD = _trouver_police()
+POLICE_FALLBACK = _trouver_police()  # Comic Neue en secours
+
+def extraire_police_pdf(chemin_pdf, nom_cible="MoreSugar"):
+    """Extrait More Sugar directement depuis le PDF Canva."""
+    try:
+        doc = fitz.open(chemin_pdf)
+        fonts = doc.get_page_fonts(0, full=True)
+        for f in fonts:
+            if nom_cible.lower() in f[3].lower():
+                font_data = doc.extract_font(f[0])
+                data = font_data[3]
+                if data and len(data) > 1000:
+                    chemin = f"/tmp/police_{uuid.uuid4().hex[:8]}.ttf"
+                    with open(chemin, "wb") as out:
+                        out.write(data)
+                    return chemin
+    except Exception:
+        pass
+    return POLICE_FALLBACK  # Fallback Comic Neue
 
 # ── Méta bibliothèque ───────────────────────────────────────────────────────
 def lire_meta():
@@ -43,6 +61,8 @@ def adapter_casse(prenom_nouveau, texte, prenom_ancien):
 
 def personnaliser_pdf_pages(chemin_pdf, prenom_ancien, prenom_nouveau):
     doc = fitz.open(chemin_pdf)
+    # Extraire More Sugar depuis ce PDF (taille et style préservés)
+    police = extraire_police_pdf(chemin_pdf, "MoreSugar")
     total = 0
     for page in doc:
         spans = []
@@ -59,7 +79,9 @@ def personnaliser_pdf_pages(chemin_pdf, prenom_ancien, prenom_nouveau):
         for span in spans:
             texte_nouveau = adapter_casse(prenom_nouveau, span["text"], prenom_ancien)
             page.insert_text(span["origin"], texte_nouveau,
-                             fontfile=POLICE_BD, fontsize=span["size"], color=(0,0,0))
+                             fontfile=police,       # More Sugar extraite du PDF
+                             fontsize=span["size"], # taille exacte préservée
+                             color=(0, 0, 0))
             total += 1
     return doc, total
 
