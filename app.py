@@ -105,7 +105,7 @@ def generer_couverture(prompt_template, prenom, style_notes=""):
         "https://api.poyo.ai/api/generate/submit",
         headers=headers,
         json={
-            "model": "gpt-image-1.5",
+            "model": "gpt-image-2",
             "input": {
                 "prompt": prompt,
                 "size": "2:3",
