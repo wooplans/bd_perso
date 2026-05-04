@@ -7,7 +7,7 @@ app = Flask(__name__)
 BIBLIO_FOLDER = "./bibliotheque"
 OUTPUT_FOLDER = "./output"
 META_FILE     = "./bibliotheque/meta.json"
-OPENAI_KEY    = os.environ.get("OPENAI_API_KEY", "")
+POYO_API_KEY  = os.environ.get("POYO_API_KEY", "")
 
 os.makedirs(BIBLIO_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
@@ -87,48 +87,70 @@ def personnaliser_pdf_pages(chemin_pdf, prenom_ancien, prenom_nouveau):
 
 # ── Génération couverture via GPT-Image ────────────────────────────────────
 def generer_couverture(prompt_template, prenom, style_notes=""):
-    """Appelle GPT-Image-1 pour générer une couverture personnalisée."""
+    """
+    Génère une couverture via Poyo API (gpt-image-1.5).
+    API asynchrone : soumet la tâche puis poll jusqu'à finished.
+    """
     prompt = prompt_template.replace("{PRENOM}", prenom).replace("{prenom}", prenom)
     if style_notes:
         prompt += f"\n\nStyle : {style_notes}"
 
-    response = http_requests.post(
-        "https://api.openai.com/v1/images/generations",
-        headers={
-            "Authorization": f"Bearer {OPENAI_KEY}",
-            "Content-Type": "application/json"
-        },
+    headers = {
+        "Authorization": f"Bearer {POYO_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    # ── 1. Soumettre la tâche ──────────────────────────────────────────────
+    resp = http_requests.post(
+        "https://api.poyo.ai/api/generate/submit",
+        headers=headers,
         json={
-            "model": "gpt-image-1",
-            "prompt": prompt,
-            "n": 1,
-            "size": "1024x1536",
-            "quality": "medium",
-            "output_format": "png"
+            "model": "gpt-image-1.5",
+            "input": {
+                "prompt": prompt,
+                "size": "2:3",
+                "n": 1
+            }
         },
-        timeout=120
+        timeout=30
     )
-    if response.status_code != 200:
-        raise Exception(f"OpenAI error {response.status_code}: {response.text[:200]}")
+    if resp.status_code != 200:
+        raise Exception(f"Poyo submit error {resp.status_code}: {resp.text[:300]}")
 
-    data = response.json()
-    # gpt-image-1 retourne base64
-    img_b64 = data["data"][0].get("b64_json") or data["data"][0].get("url")
+    task_id = resp.json()["data"]["task_id"]
 
-    if img_b64 and not img_b64.startswith("http"):
-        img_bytes = base64.b64decode(img_b64)
-        chemin = os.path.join(OUTPUT_FOLDER, f"couv_{uuid.uuid4().hex[:8]}.png")
-        with open(chemin, "wb") as f:
-            f.write(img_bytes)
-        return chemin
-    elif img_b64 and img_b64.startswith("http"):
-        r = http_requests.get(img_b64, timeout=60)
-        chemin = os.path.join(OUTPUT_FOLDER, f"couv_{uuid.uuid4().hex[:8]}.png")
-        with open(chemin, "wb") as f:
-            f.write(r.content)
-        return chemin
-    else:
-        raise Exception("Réponse OpenAI inattendue")
+    # ── 2. Poller le statut ────────────────────────────────────────────────
+    start = __import__("time").time()
+    while True:
+        if __import__("time").time() - start > 120:
+            raise Exception("Timeout : génération couverture > 120s")
+
+        __import__("time").sleep(3)
+
+        status_resp = http_requests.get(
+            f"https://api.poyo.ai/api/generate/status/{task_id}",
+            headers=headers,
+            timeout=15
+        )
+        if status_resp.status_code != 200:
+            continue
+
+        data = status_resp.json()["data"]
+        status = data["status"]
+
+        if status == "finished":
+            file_url = data["files"][0]["file_url"]
+            # Télécharger l'image générée
+            img_resp = http_requests.get(file_url, timeout=60)
+            chemin = os.path.join(OUTPUT_FOLDER, f"couv_{uuid.uuid4().hex[:8]}.png")
+            with open(chemin, "wb") as f:
+                f.write(img_resp.content)
+            return chemin
+
+        elif status == "failed":
+            raise Exception(f"Génération échouée : {data.get('error_message','?')}")
+
+        # not_started / running → on continue
 
 # ── Assemblage PDF final ───────────────────────────────────────────────────
 def assembler_pdf(chemin_couverture_png, doc_bd, prenom, compression):
@@ -781,8 +803,8 @@ def generer():
         prompt = prompt_couv or bd.get("prompt_couv","")
         if not prompt:
             return jsonify({"erreur":"Prompt couverture manquant"}), 400
-        if not OPENAI_KEY:
-            return jsonify({"erreur":"Clé OpenAI non configurée (variable OPENAI_API_KEY)"}), 500
+        if not POYO_API_KEY:
+            return jsonify({"erreur":"Clé Poyo non configurée (variable POYO_API_KEY)"}), 500
         try:
             chemin_couv = generer_couverture(prompt, prenom_nouveau)
         except Exception as e:
