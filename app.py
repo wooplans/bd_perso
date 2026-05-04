@@ -224,6 +224,13 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 .toggle-track:has(input:checked) .toggle-knob{transform:translateX(20px)}
 .couv-options{display:none}
 .couv-options.visible{display:block}
+.couv-upload{display:none}
+.couv-upload.visible{display:block}
+.zone-couv{border:2.5px dashed rgba(255,107,53,.3);border-radius:12px;padding:18px 14px;text-align:center;cursor:pointer;transition:all .2s;background:rgba(255,107,53,.03);position:relative;margin-top:12px}
+.zone-couv:hover,.zone-couv.survol{border-color:var(--orange);background:rgba(255,107,53,.06)}
+.zone-couv.ok{border-color:var(--vert);background:rgba(6,214,160,.05)}
+.zone-couv input{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%}
+.couv-preview{display:none;margin-top:10px;width:100%;max-height:160px;object-fit:contain;border-radius:8px;border:2px solid rgba(6,214,160,.3)}
 
 /* Compression */
 .comp-row{display:flex;gap:8px;margin-bottom:14px}
@@ -329,7 +336,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
     <input type="text" class="champ" id="prenom-nouveau" placeholder="Ex : AMINATA"
            oninput="majApercu()" autocomplete="off">
 
-    <!-- Couverture IA -->
+    <!-- Couverture -->
     <div class="section-couv">
       <div class="toggle-row" id="toggle-row">
         <span class="toggle-label">🎨 Générer la couverture avec IA</span>
@@ -338,14 +345,30 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
           <span class="toggle-knob"></span>
         </label>
       </div>
+
+      <!-- Mode IA : prompt -->
       <div class="couv-options" id="couv-options">
         <div class="sep"></div>
         <label class="label">Prompt de la couverture</label>
         <textarea class="textarea" id="prompt-couv"
-          placeholder="Ex : Couverture de BD pour enfants africains. Le héros s'appelle {PRENOM}, garçon de 8 ans avec des lunettes rondes, en uniforme scolaire. Style manga africain, noir et blanc. Titre en haut : « {PRENOM} sauve son école ». Académie des Génies. Fond dynamique avec éclairs et engrenages."></textarea>
+          placeholder="Ex : Couverture BD enfants africains. Héros = {PRENOM}, 8 ans, lunettes, uniforme. Style manga noir et blanc. Titre : « {PRENOM} sauve son école »."></textarea>
         <div style="font-size:.72rem;color:var(--doux);margin-top:-10px;margin-bottom:14px">
-          💡 Utilise <strong>{PRENOM}</strong> dans le prompt — il sera remplacé automatiquement
+          💡 Utilise <strong>{PRENOM}</strong> dans le prompt — remplacé automatiquement
         </div>
+      </div>
+
+      <!-- Mode Manuel : upload image -->
+      <div class="couv-upload" id="couv-upload">
+        <div class="sep"></div>
+        <label class="label">Couverture personnalisée</label>
+        <div class="zone-couv" id="zone-couv">
+          <input type="file" id="input-couv" accept="image/*,.pdf" onchange="previewCouv()">
+          <span style="font-size:1.8rem;display:block;margin-bottom:6px">🖼️</span>
+          <div style="font-size:.85rem;font-weight:700;color:var(--orange);margin-bottom:2px">Glisse la couverture ici</div>
+          <div style="font-size:.75rem;color:var(--doux)">PNG, JPG, WEBP ou PDF</div>
+        </div>
+        <img class="couv-preview" id="couv-preview" src="" alt="Aperçu couverture">
+        <div id="couv-nom" style="display:none;font-size:.78rem;font-weight:700;color:var(--vert);margin-top:6px;text-align:center"></div>
       </div>
     </div>
 
@@ -430,11 +453,28 @@ function changerOnglet(id, btn) {
 
 // ── Toggle couverture ─────────────────────────────────────────────────────────
 function toggleCouv() {
-  const on = document.getElementById('toggle-couv').checked;
+  const on   = document.getElementById('toggle-couv').checked;
   const opts = document.getElementById('couv-options');
+  const up   = document.getElementById('couv-upload');
   const row  = document.getElementById('toggle-row');
-  opts.classList.toggle('visible', on);
-  row.classList.toggle('open', on);
+  opts.classList.toggle('visible', on);   // IA actif → prompt visible
+  up.classList.toggle('visible', !on);    // IA inactif → upload visible
+  row.classList.toggle('open', true);
+}
+
+function previewCouv() {
+  const input = document.getElementById('input-couv');
+  const f = input.files[0];
+  if (!f) return;
+  document.getElementById('couv-nom').style.display = 'block';
+  document.getElementById('couv-nom').textContent = '✓ ' + f.name;
+  document.getElementById('zone-couv').classList.add('ok');
+  // Aperçu image seulement (pas PDF)
+  if (f.type.startsWith('image/')) {
+    const url = URL.createObjectURL(f);
+    const prev = document.getElementById('couv-preview');
+    prev.src = url; prev.style.display = 'block';
+  }
 }
 
 // ── Compression ───────────────────────────────────────────────────────────────
@@ -575,6 +615,7 @@ async function generer() {
   const nouveau = document.getElementById('prenom-nouveau').value.trim();
   const avecCouv = document.getElementById('toggle-couv').checked;
   const prompt   = document.getElementById('prompt-couv').value.trim();
+  const inputCouv = document.getElementById('input-couv');
   const errEl    = document.getElementById('err-perso');
   errEl.className = 'msg err';
 
@@ -592,17 +633,21 @@ async function generer() {
   setStep('step-bd');
 
   try {
-    const res = await fetch('/generer', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        bd_id: bdId,
-        prenom_nouveau: nouveau,
-        avec_couverture: avecCouv,
-        prompt_couverture: prompt,
-        compression: compression
-      })
-    });
+    // Préparer la requête (FormData pour gérer l'image de couverture)
+    const fd = new FormData();
+    fd.append('bd_id', bdId);
+    fd.append('prenom_nouveau', nouveau);
+    fd.append('avec_couverture', avecCouv ? '1' : '0');
+    fd.append('prompt_couverture', prompt);
+    fd.append('compression', compression);
+
+    // Couverture image manuelle
+    const inputCouv = document.getElementById('input-couv');
+    if (!avecCouv && inputCouv.files[0]) {
+      fd.append('couverture_image', inputCouv.files[0]);
+    }
+
+    const res = await fetch('/generer', { method: 'POST', body: fd });
 
     // Simuler progression visuelle
     if (avecCouv) {
@@ -653,6 +698,9 @@ function affMsg(el, txt, cls) {
 
 // Init
 chargerSelectBD();
+// Couverture upload visible par défaut (toggle IA = OFF)
+document.getElementById('couv-upload').classList.add('visible');
+document.getElementById('toggle-row').classList.add('open');
 </script>
 </body>
 </html>"""
@@ -701,12 +749,13 @@ def supprimer_bd(bd_id):
 
 @app.route("/generer", methods=["POST"])
 def generer():
-    data          = request.json
-    bd_id         = data.get("bd_id","")
-    prenom_nouveau= data.get("prenom_nouveau","").strip()
-    avec_couv     = data.get("avec_couverture", False)
-    prompt_couv   = data.get("prompt_couverture","").strip()
-    compression   = data.get("compression","moyenne")
+    # Accepte FormData (pour l'image de couverture)
+    bd_id          = request.form.get("bd_id","")
+    prenom_nouveau = request.form.get("prenom_nouveau","").strip()
+    avec_couv      = request.form.get("avec_couverture","0") == "1"
+    prompt_couv    = request.form.get("prompt_couverture","").strip()
+    compression    = request.form.get("compression","moyenne")
+    couv_image     = request.files.get("couverture_image")
 
     meta = lire_meta()
     if bd_id not in meta:
@@ -725,9 +774,10 @@ def generer():
     if nb == 0:
         return jsonify({"erreur": f"'{prenom_ancien}' introuvable dans le PDF"}), 404
 
-    # ── 2. Couverture IA (optionnelle) ──
+    # ── 2. Couverture ──
     chemin_couv = None
     if avec_couv:
+        # Mode IA : génération GPT-Image
         prompt = prompt_couv or bd.get("prompt_couv","")
         if not prompt:
             return jsonify({"erreur":"Prompt couverture manquant"}), 400
@@ -737,10 +787,44 @@ def generer():
             chemin_couv = generer_couverture(prompt, prenom_nouveau)
         except Exception as e:
             return jsonify({"erreur": f"Erreur couverture IA : {str(e)}"}), 500
+    elif couv_image:
+        # Mode Manuel : image uploadée → convertie en PNG temporaire
+        try:
+            import tempfile
+            from PIL import Image as PILImage
+            ext = couv_image.filename.rsplit(".",1)[-1].lower()
+            chemin_tmp = f"/tmp/couv_upload_{uuid.uuid4().hex[:8]}.{ext}"
+            couv_image.save(chemin_tmp)
+            # Convertir en PNG si besoin (PyMuPDF accepte PNG/JPEG/PDF)
+            if ext in ("jpg","jpeg","png","webp"):
+                img = PILImage.open(chemin_tmp).convert("RGB")
+                chemin_couv = f"/tmp/couv_{uuid.uuid4().hex[:8]}.png"
+                img.save(chemin_couv, "PNG")
+                os.remove(chemin_tmp)
+            elif ext == "pdf":
+                chemin_couv = chemin_tmp  # déjà un PDF, géré séparément
+            else:
+                return jsonify({"erreur":"Format couverture non supporté"}), 400
+        except Exception as e:
+            return jsonify({"erreur": f"Erreur couverture image : {str(e)}"}), 500
 
     # ── 3. Assembler ──
     try:
-        if chemin_couv:
+        if chemin_couv and chemin_couv.endswith(".pdf"):
+            # Couverture déjà en PDF → insérer directement
+            doc_couv = fitz.open(chemin_couv)
+            pdf_final = fitz.open()
+            pdf_final.insert_pdf(doc_couv)
+            pdf_final.insert_pdf(doc_bd)
+            nom = f"BD_{prenom_nouveau.capitalize()}_{uuid.uuid4().hex[:6]}.pdf"
+            chemin_final = os.path.join(OUTPUT_FOLDER, nom)
+            if compression == "forte":
+                pdf_final.save(chemin_final, garbage=4, deflate=True, clean=True, deflate_images=True, deflate_fonts=True)
+            elif compression == "moyenne":
+                pdf_final.save(chemin_final, garbage=3, deflate=True, clean=True)
+            else:
+                pdf_final.save(chemin_final)
+        elif chemin_couv:
             chemin_final = assembler_pdf(chemin_couv, doc_bd, prenom_nouveau, compression)
         else:
             chemin_final = assembler_pdf_sans_couverture(doc_bd, prenom_nouveau, compression)
