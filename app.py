@@ -24,20 +24,42 @@ def _trouver_police():
 
 POLICE_FALLBACK = _trouver_police()  # Comic Neue en secours
 
+# Dossier fonts dans le repo (polices complètes uploadées)
+FONTS_FOLDER = "./fonts"
+os.makedirs(FONTS_FOLDER, exist_ok=True)
+
+def trouver_police_repo(nom_span):
+    """
+    Cherche une police complète dans ./fonts/ du repo.
+    Correspondance souple sur le nom de fichier.
+    Ex: span "ComicSansMS" → cherche comic, comicsans, ComicSans dans ./fonts/
+    """
+    nom_lower = nom_span.lower().replace("-","").replace(" ","").replace("_","")
+    try:
+        for f in os.listdir(FONTS_FOLDER):
+            if f.lower().endswith((".ttf",".otf")):
+                f_lower = f.lower().replace("-","").replace(" ","").replace("_","")
+                nom_f = f_lower.replace(".ttf","").replace(".otf","")
+                # Correspondance si l'un contient l'autre
+                if nom_lower in nom_f or nom_f in nom_lower:
+                    return os.path.join(FONTS_FOLDER, f)
+    except Exception:
+        pass
+    return None
+
 def extraire_polices_pdf(doc):
     """
-    Extrait toutes les polices embarquées du PDF.
-    Retourne un dict : { nom_police_normalisé → chemin_fichier_tmp }
-    Utilise un cache /tmp pour éviter les extractions multiples.
+    Extrait les polices embarquées du PDF.
+    ⚠️ Canva sous-ensemblise les polices (glyphes limités).
+    Retourne un dict : { nom_normalisé → chemin_tmp }
     """
     cache = {}
     try:
         fonts = doc.get_page_fonts(0, full=True)
         for f in fonts:
             xref     = f[0]
-            nom_full = f[3]  # ex: "AAAAAA+MoreSugarRegular"
-            # Normaliser : enlever le préfixe subset (AAAAAA+)
-            nom_clean = nom_full.split("+")[-1].lower()  # ex: "moresugarregular"
+            nom_full = f[3]
+            nom_clean = nom_full.split("+")[-1].lower()
             if nom_clean in cache:
                 continue
             font_data = doc.extract_font(xref)
@@ -53,18 +75,26 @@ def extraire_polices_pdf(doc):
 
 def police_pour_span(span, cache_polices):
     """
-    Retourne le chemin de la police correspondant au span.
-    Cherche dans le cache par correspondance de nom.
-    Fallback sur Comic Neue si introuvable.
+    Priorité :
+    1. Police complète dans ./fonts/ du repo  ← idéal, glyphes complets
+    2. Police extraite du PDF                 ← glyphes limités (subset Canva)
+    3. Fallback Comic Neue
     """
-    nom_span = span["font"].lower()  # ex: "moresugarregular"
-    # Correspondance exacte
+    nom_span = span["font"].lower()
+
+    # 1. Chercher dans ./fonts/ (police complète)
+    police_repo = trouver_police_repo(nom_span)
+    if police_repo:
+        return police_repo
+
+    # 2. Police extraite du PDF (attention aux glyphes manquants)
     if nom_span in cache_polices:
         return cache_polices[nom_span]
-    # Correspondance partielle (cas Comic Sans → comicsans, comicsansms, etc.)
     for nom_cache, chemin in cache_polices.items():
         if nom_span in nom_cache or nom_cache in nom_span:
             return chemin
+
+    # 3. Fallback
     return POLICE_FALLBACK
 
 # ── Méta bibliothèque ───────────────────────────────────────────────────────
