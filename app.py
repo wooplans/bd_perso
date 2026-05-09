@@ -24,23 +24,48 @@ def _trouver_police():
 
 POLICE_FALLBACK = _trouver_police()  # Comic Neue en secours
 
-def extraire_police_pdf(chemin_pdf, nom_cible="MoreSugar"):
-    """Extrait More Sugar directement depuis le PDF Canva."""
+def extraire_polices_pdf(doc):
+    """
+    Extrait toutes les polices embarquées du PDF.
+    Retourne un dict : { nom_police_normalisé → chemin_fichier_tmp }
+    Utilise un cache /tmp pour éviter les extractions multiples.
+    """
+    cache = {}
     try:
-        doc = fitz.open(chemin_pdf)
         fonts = doc.get_page_fonts(0, full=True)
         for f in fonts:
-            if nom_cible.lower() in f[3].lower():
-                font_data = doc.extract_font(f[0])
-                data = font_data[3]
-                if data and len(data) > 1000:
-                    chemin = f"/tmp/police_{uuid.uuid4().hex[:8]}.ttf"
-                    with open(chemin, "wb") as out:
-                        out.write(data)
-                    return chemin
+            xref     = f[0]
+            nom_full = f[3]  # ex: "AAAAAA+MoreSugarRegular"
+            # Normaliser : enlever le préfixe subset (AAAAAA+)
+            nom_clean = nom_full.split("+")[-1].lower()  # ex: "moresugarregular"
+            if nom_clean in cache:
+                continue
+            font_data = doc.extract_font(xref)
+            data = font_data[3]
+            if data and len(data) > 500:
+                chemin = f"/tmp/police_{nom_clean}_{uuid.uuid4().hex[:6]}.ttf"
+                with open(chemin, "wb") as out:
+                    out.write(data)
+                cache[nom_clean] = chemin
     except Exception:
         pass
-    return POLICE_FALLBACK  # Fallback Comic Neue
+    return cache
+
+def police_pour_span(span, cache_polices):
+    """
+    Retourne le chemin de la police correspondant au span.
+    Cherche dans le cache par correspondance de nom.
+    Fallback sur Comic Neue si introuvable.
+    """
+    nom_span = span["font"].lower()  # ex: "moresugarregular"
+    # Correspondance exacte
+    if nom_span in cache_polices:
+        return cache_polices[nom_span]
+    # Correspondance partielle (cas Comic Sans → comicsans, comicsansms, etc.)
+    for nom_cache, chemin in cache_polices.items():
+        if nom_span in nom_cache or nom_cache in nom_span:
+            return chemin
+    return POLICE_FALLBACK
 
 # ── Méta bibliothèque ───────────────────────────────────────────────────────
 def lire_meta():
@@ -61,28 +86,49 @@ def adapter_casse(prenom_nouveau, texte, prenom_ancien):
 
 def personnaliser_pdf_pages(chemin_pdf, prenom_ancien, prenom_nouveau):
     doc = fitz.open(chemin_pdf)
-    # Extraire More Sugar depuis ce PDF (taille et style préservés)
-    police = extraire_police_pdf(chemin_pdf, "MoreSugar")
+    # Extraire TOUTES les polices du PDF en une seule passe
+    cache_polices = extraire_polices_pdf(doc)
     total = 0
+
     for page in doc:
-        spans = []
-        for b in page.get_text("dict")["blocks"]:
-            if b["type"] != 0: continue
-            for line in b["lines"]:
-                for span in line["spans"]:
-                    if prenom_ancien.upper() in span["text"].upper():
-                        spans.append(span)
-        for span in spans:
-            bbox = fitz.Rect(span["bbox"])
-            page.add_redact_annot(fitz.Rect(bbox.x0-1, bbox.y0-1, bbox.x1+1, bbox.y1+1), fill=(1,1,1))
+        blocs_a_reecrire = []
+
+        for bloc in page.get_text("dict")["blocks"]:
+            if bloc["type"] != 0:
+                continue
+            # Vérifier si le prénom apparaît dans ce bloc (n'importe quelle ligne)
+            if not any(prenom_ancien.upper() in span["text"].upper()
+                       for line in bloc["lines"] for span in line["spans"]):
+                continue
+            # Collecter tous les spans du bloc
+            blocs_a_reecrire.append([
+                span for line in bloc["lines"] for span in line["spans"]
+            ])
+
+        # ── Étape 1 : effacer tous les spans des blocs ciblés ──────────────
+        for spans_bloc in blocs_a_reecrire:
+            for span in spans_bloc:
+                bbox = fitz.Rect(span["bbox"])
+                page.add_redact_annot(
+                    fitz.Rect(bbox.x0-1, bbox.y0-1, bbox.x1+1, bbox.y1+1),
+                    fill=(1, 1, 1)
+                )
         page.apply_redactions()
-        for span in spans:
-            texte_nouveau = adapter_casse(prenom_nouveau, span["text"], prenom_ancien)
-            page.insert_text(span["origin"], texte_nouveau,
-                             fontfile=police,       # More Sugar extraite du PDF
-                             fontsize=span["size"], # taille exacte préservée
-                             color=(0, 0, 0))
-            total += 1
+
+        # ── Étape 2 : réécrire avec la police exacte de chaque span ────────
+        for spans_bloc in blocs_a_reecrire:
+            for span in spans_bloc:
+                texte_nouveau = adapter_casse(prenom_nouveau, span["text"], prenom_ancien)
+                police = police_pour_span(span, cache_polices)
+                page.insert_text(
+                    span["origin"],
+                    texte_nouveau,
+                    fontfile=police,
+                    fontsize=span["size"],  # taille exacte préservée
+                    color=(0, 0, 0)
+                )
+                total += 1
+
     return doc, total
 
 # ── Génération couverture via GPT-Image ────────────────────────────────────
