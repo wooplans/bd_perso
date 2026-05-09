@@ -30,19 +30,25 @@ os.makedirs(FONTS_FOLDER, exist_ok=True)
 
 def trouver_police_repo(nom_span):
     """
-    Cherche une police complète dans ./fonts/ du repo.
+    Cherche une police complète dans ./fonts/ ET à la racine du repo.
     Correspondance souple sur le nom de fichier.
-    Ex: span "ComicSansMS" → cherche comic, comicsans, ComicSans dans ./fonts/
+    Ex: span "ComicSansMS" → trouve comic.ttf
     """
     nom_lower = nom_span.lower().replace("-","").replace(" ","").replace("_","")
+
+    # Dossiers à chercher : racine du repo + sous-dossier fonts/
+    dossiers = [".", FONTS_FOLDER]
+
     try:
-        for f in os.listdir(FONTS_FOLDER):
-            if f.lower().endswith((".ttf",".otf")):
-                f_lower = f.lower().replace("-","").replace(" ","").replace("_","")
-                nom_f = f_lower.replace(".ttf","").replace(".otf","")
-                # Correspondance si l'un contient l'autre
-                if nom_lower in nom_f or nom_f in nom_lower:
-                    return os.path.join(FONTS_FOLDER, f)
+        for dossier in dossiers:
+            if not os.path.exists(dossier):
+                continue
+            for f in os.listdir(dossier):
+                if f.lower().endswith((".ttf",".otf")):
+                    f_lower = f.lower().replace("-","").replace(" ","").replace("_","")
+                    nom_f = f_lower.replace(".ttf","").replace(".otf","")
+                    if nom_lower in nom_f or nom_f in nom_lower:
+                        return os.path.join(dossier, f)
     except Exception:
         pass
     return None
