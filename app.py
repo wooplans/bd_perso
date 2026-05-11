@@ -1,13 +1,12 @@
 from flask import Flask, request, jsonify, send_file
 import fitz
-import re, os, uuid, json, glob, base64, requests as http_requests
+import re, os, uuid, json, glob
 
 app = Flask(__name__)
 
 BIBLIO_FOLDER = "./bibliotheque"
 OUTPUT_FOLDER = "./output"
 META_FILE     = "./bibliotheque/meta.json"
-POYO_API_KEY  = os.environ.get("POYO_API_KEY", "")
 
 os.makedirs(BIBLIO_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
@@ -167,106 +166,19 @@ def personnaliser_pdf_pages(chemin_pdf, prenom_ancien, prenom_nouveau):
 
     return doc, total
 
-# ── Génération couverture via GPT-Image ────────────────────────────────────
-def generer_couverture(prompt_template, prenom, style_notes=""):
-    """
-    Génère une couverture via Poyo API (gpt-image-1.5).
-    API asynchrone : soumet la tâche puis poll jusqu'à finished.
-    """
-    prompt = prompt_template.replace("{PRENOM}", prenom).replace("{prenom}", prenom)
-    if style_notes:
-        prompt += f"\n\nStyle : {style_notes}"
-
-    headers = {
-        "Authorization": f"Bearer {POYO_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    # ── 1. Soumettre la tâche ──────────────────────────────────────────────
-    resp = http_requests.post(
-        "https://api.poyo.ai/api/generate/submit",
-        headers=headers,
-        json={
-            "model": "gpt-image-2",
-            "input": {
-                "prompt": prompt,
-                "size": "2:3",
-                "n": 1
-            }
-        },
-        timeout=30
-    )
-    if resp.status_code != 200:
-        raise Exception(f"Poyo submit error {resp.status_code}: {resp.text[:300]}")
-
-    task_id = resp.json()["data"]["task_id"]
-
-    # ── 2. Poller le statut ────────────────────────────────────────────────
-    start = __import__("time").time()
-    while True:
-        if __import__("time").time() - start > 120:
-            raise Exception("Timeout : génération couverture > 120s")
-
-        __import__("time").sleep(3)
-
-        status_resp = http_requests.get(
-            f"https://api.poyo.ai/api/generate/status/{task_id}",
-            headers=headers,
-            timeout=15
-        )
-        if status_resp.status_code != 200:
-            continue
-
-        data = status_resp.json()["data"]
-        status = data["status"]
-
-        if status == "finished":
-            file_url = data["files"][0]["file_url"]
-            # Télécharger l'image générée
-            img_resp = http_requests.get(file_url, timeout=60)
-            chemin = os.path.join(OUTPUT_FOLDER, f"couv_{uuid.uuid4().hex[:8]}.png")
-            with open(chemin, "wb") as f:
-                f.write(img_resp.content)
-            return chemin
-
-        elif status == "failed":
-            raise Exception(f"Génération échouée : {data.get('error_message','?')}")
-
-        # not_started / running → on continue
-
 # ── Assemblage PDF final ───────────────────────────────────────────────────
-def assembler_pdf(chemin_couverture_png, doc_bd, prenom, compression):
-    """Fusionne couverture PNG + pages BD en un seul PDF."""
+def assembler_pdf(docs, prenom, compression):
+    """
+    Assemble une liste de fitz.Document en un seul PDF final.
+    docs = [doc_couverture, doc_bd] ou [doc_bd] si pas de couverture.
+    """
     pdf_final = fitz.open()
+    for doc in docs:
+        pdf_final.insert_pdf(doc)
 
-    # ── Page de couverture ──
-    img = fitz.open(chemin_couverture_png)
-    img_pdf = fitz.open("pdf", img.convert_to_pdf())
-    pdf_final.insert_pdf(img_pdf)
-
-    # ── Pages BD ──
-    pdf_final.insert_pdf(doc_bd)
-
-    # ── Compression ──
     nom = f"BD_{prenom.capitalize()}_{uuid.uuid4().hex[:6]}.pdf"
     chemin = os.path.join(OUTPUT_FOLDER, nom)
 
-    if compression == "forte":
-        pdf_final.save(chemin, garbage=4, deflate=True, clean=True,
-                       deflate_images=True, deflate_fonts=True)
-    elif compression == "moyenne":
-        pdf_final.save(chemin, garbage=3, deflate=True, clean=True)
-    else:  # aucune
-        pdf_final.save(chemin)
-
-    return chemin
-
-def assembler_pdf_sans_couverture(doc_bd, prenom, compression):
-    """PDF sans couverture — juste les pages BD personnalisées."""
-    pdf_final = fitz.open()
-    pdf_final.insert_pdf(doc_bd)
-    nom = f"BD_{prenom.capitalize()}_{uuid.uuid4().hex[:6]}.pdf"
-    chemin = os.path.join(OUTPUT_FOLDER, nom)
     if compression == "forte":
         pdf_final.save(chemin, garbage=4, deflate=True, clean=True,
                        deflate_images=True, deflate_fonts=True)
@@ -274,6 +186,7 @@ def assembler_pdf_sans_couverture(doc_bd, prenom, compression):
         pdf_final.save(chemin, garbage=3, deflate=True, clean=True)
     else:
         pdf_final.save(chemin)
+
     return chemin
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -321,20 +234,8 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 .toggle-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:0}
 .toggle-row.open{margin-bottom:12px}
 .toggle-label{font-size:.85rem;font-weight:800;color:var(--texte)}
-.toggle-track{position:relative;width:44px;height:24px;background:rgba(108,60,225,.2);border-radius:12px;transition:background .2s;cursor:pointer;flex-shrink:0}
-.toggle-track:has(input:checked){background:var(--violet)}
-.toggle-track input{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%}
-.toggle-knob{position:absolute;top:3px;left:3px;width:18px;height:18px;background:#fff;border-radius:50%;transition:transform .2s;pointer-events:none}
-.toggle-track:has(input:checked) .toggle-knob{transform:translateX(20px)}
-.couv-options{display:none}
-.couv-options.visible{display:block}
-.couv-upload{display:none}
-.couv-upload.visible{display:block}
-.zone-couv{border:2.5px dashed rgba(255,107,53,.3);border-radius:12px;padding:18px 14px;text-align:center;cursor:pointer;transition:all .2s;background:rgba(255,107,53,.03);position:relative;margin-top:12px}
-.zone-couv:hover,.zone-couv.survol{border-color:var(--orange);background:rgba(255,107,53,.06)}
-.zone-couv.ok{border-color:var(--vert);background:rgba(6,214,160,.05)}
-.zone-couv input{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%}
-.couv-preview{display:none;margin-top:10px;width:100%;max-height:160px;object-fit:contain;border-radius:8px;border:2px solid rgba(6,214,160,.3)}
+
+
 
 /* Compression */
 .comp-row{display:flex;gap:8px;margin-bottom:14px}
@@ -440,42 +341,6 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
     <input type="text" class="champ" id="prenom-nouveau" placeholder="Ex : AMINATA"
            oninput="majApercu()" autocomplete="off">
 
-    <!-- Couverture -->
-    <div class="section-couv">
-      <div class="toggle-row" id="toggle-row">
-        <span class="toggle-label">🎨 Générer la couverture avec IA</span>
-        <label class="toggle-track">
-          <input type="checkbox" id="toggle-couv" onchange="toggleCouv()">
-          <span class="toggle-knob"></span>
-        </label>
-      </div>
-
-      <!-- Mode IA : prompt -->
-      <div class="couv-options" id="couv-options">
-        <div class="sep"></div>
-        <label class="label">Prompt de la couverture</label>
-        <textarea class="textarea" id="prompt-couv"
-          placeholder="Ex : Couverture BD enfants africains. Héros = {PRENOM}, 8 ans, lunettes, uniforme. Style manga noir et blanc. Titre : « {PRENOM} sauve son école »."></textarea>
-        <div style="font-size:.72rem;color:var(--doux);margin-top:-10px;margin-bottom:14px">
-          💡 Utilise <strong>{PRENOM}</strong> dans le prompt — remplacé automatiquement
-        </div>
-      </div>
-
-      <!-- Mode Manuel : upload image -->
-      <div class="couv-upload" id="couv-upload">
-        <div class="sep"></div>
-        <label class="label">Couverture personnalisée</label>
-        <div class="zone-couv" id="zone-couv">
-          <input type="file" id="input-couv" accept="image/*,.pdf" onchange="previewCouv()">
-          <span style="font-size:1.8rem;display:block;margin-bottom:6px">🖼️</span>
-          <div style="font-size:.85rem;font-weight:700;color:var(--orange);margin-bottom:2px">Glisse la couverture ici</div>
-          <div style="font-size:.75rem;color:var(--doux)">PNG, JPG, WEBP ou PDF</div>
-        </div>
-        <img class="couv-preview" id="couv-preview" src="" alt="Aperçu couverture">
-        <div id="couv-nom" style="display:none;font-size:.78rem;font-weight:700;color:var(--vert);margin-top:6px;text-align:center"></div>
-      </div>
-    </div>
-
     <!-- Compression -->
     <label class="label">Compression du PDF final</label>
     <div class="comp-row">
@@ -490,7 +355,6 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
       <div class="points"><span></span><span></span><span></span></div>
       <ul class="loader-steps" id="loader-steps">
         <li id="step-bd">Personnalisation de la BD…</li>
-        <li id="step-couv">Génération de la couverture IA…</li>
         <li id="step-assemble">Assemblage du PDF…</li>
         <li id="step-compress">Compression…</li>
       </ul>
@@ -512,23 +376,36 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
   <!-- ═══ ONGLET BIBLIOTHÈQUE ═══ -->
   <div class="carte" style="display:none" id="carte-biblio">
 
+    <!-- Pages BD -->
+    <label class="label">Pages BD (PDF Canva)</label>
     <div class="zone-upload" id="zone-up">
       <input type="file" id="input-pdf" accept=".pdf">
       <span class="icone">📄</span>
-      <div class="lbl">Ajouter une BD à la bibliothèque</div>
-      <div class="sub">Glisse le PDF ici ou clique</div>
+      <div class="lbl">Glisse le PDF des pages ici</div>
+      <div class="sub">Export PDF depuis Canva</div>
       <div class="nom-fichier" id="nom-fich"></div>
     </div>
 
     <label class="label">Nom de la BD</label>
     <input type="text" class="champ-nom" id="nom-bd" placeholder="Ex : Académie des Génies — Tome 1">
 
-    <label class="label">Prénom placeholder dans le PDF</label>
+    <label class="label">Prénom placeholder dans les pages</label>
     <input type="text" class="champ-nom" id="prenom-bd" placeholder="Ex : WILLIAM">
 
-    <label class="label">Prompt couverture (optionnel)</label>
-    <textarea class="textarea" id="prompt-biblio"
-      placeholder="Ex : Couverture BD enfants africains. Héros = {PRENOM}, 8 ans, lunettes, uniforme. Style manga noir et blanc. Titre : « {PRENOM} sauve son école »."></textarea>
+    <div class="sep"></div>
+
+    <!-- Couverture PDF -->
+    <label class="label">Couverture (PDF Canva — optionnel)</label>
+    <div class="zone-upload" id="zone-couv-biblio">
+      <input type="file" id="input-couv-biblio" accept=".pdf">
+      <span class="icone">🎨</span>
+      <div class="lbl">Glisse la couverture ici</div>
+      <div class="sub">PDF Canva avec le prénom</div>
+      <div class="nom-fichier" id="nom-couv-fich"></div>
+    </div>
+
+    <label class="label">Prénom placeholder sur la couverture</label>
+    <input type="text" class="champ-nom" id="prenom-couv-bd" placeholder="Ex : WILLIAM (laisser vide = même que pages)">
 
     <button class="btn-sm" onclick="uploadBD()">➕ Ajouter à la bibliothèque</button>
     <div class="msg" id="msg-upload"></div>
@@ -556,30 +433,7 @@ function changerOnglet(id, btn) {
 }
 
 // ── Toggle couverture ─────────────────────────────────────────────────────────
-function toggleCouv() {
-  const on   = document.getElementById('toggle-couv').checked;
-  const opts = document.getElementById('couv-options');
-  const up   = document.getElementById('couv-upload');
-  const row  = document.getElementById('toggle-row');
-  opts.classList.toggle('visible', on);   // IA actif → prompt visible
-  up.classList.toggle('visible', !on);    // IA inactif → upload visible
-  row.classList.toggle('open', true);
-}
 
-function previewCouv() {
-  const input = document.getElementById('input-couv');
-  const f = input.files[0];
-  if (!f) return;
-  document.getElementById('couv-nom').style.display = 'block';
-  document.getElementById('couv-nom').textContent = '✓ ' + f.name;
-  document.getElementById('zone-couv').classList.add('ok');
-  // Aperçu image seulement (pas PDF)
-  if (f.type.startsWith('image/')) {
-    const url = URL.createObjectURL(f);
-    const prev = document.getElementById('couv-preview');
-    prev.src = url; prev.style.display = 'block';
-  }
-}
 
 // ── Compression ───────────────────────────────────────────────────────────────
 function setComp(val, btn) {
@@ -602,6 +456,16 @@ inputPdf.addEventListener('change', () => {
       document.getElementById('nom-bd').value = f.name.replace('.pdf','');
   }
 });
+
+document.getElementById('input-couv-biblio').addEventListener('change', function() {
+  const f = this.files[0];
+  if (f) {
+    document.getElementById('zone-couv-biblio').classList.add('ok');
+    const el = document.getElementById('nom-couv-fich');
+    el.style.display = 'block';
+    el.textContent = '✓ ' + f.name;
+  }
+});
 zoneUp.addEventListener('dragover', e => { e.preventDefault(); zoneUp.classList.add('survol'); });
 zoneUp.addEventListener('dragleave', () => zoneUp.classList.remove('survol'));
 zoneUp.addEventListener('drop', e => {
@@ -617,30 +481,40 @@ zoneUp.addEventListener('drop', e => {
 });
 
 async function uploadBD() {
-  const f = inputPdf.files[0];
+  const f      = inputPdf.files[0];
+  const fCouv  = document.getElementById('input-couv-biblio').files[0];
   const nom    = document.getElementById('nom-bd').value.trim();
   const prenom = document.getElementById('prenom-bd').value.trim();
-  const prompt = document.getElementById('prompt-biblio').value.trim();
+  const prenomCouv = document.getElementById('prenom-couv-bd').value.trim();
   const msgEl  = document.getElementById('msg-upload');
   msgEl.className = 'msg';
 
-  if (!f)     { affMsg(msgEl,'Choisis un fichier PDF.','err'); return; }
+  if (!f)     { affMsg(msgEl,'Choisis le PDF des pages.','err'); return; }
   if (!nom)   { affMsg(msgEl,'Donne un nom à cette BD.','err'); return; }
   if (!prenom){ affMsg(msgEl,'Indique le prénom placeholder.','err'); return; }
 
   const fd = new FormData();
-  fd.append('pdf', f); fd.append('nom', nom);
-  fd.append('prenom', prenom); fd.append('prompt_couv', prompt);
+  fd.append('pdf', f);
+  fd.append('nom', nom);
+  fd.append('prenom', prenom);
+  fd.append('prenom_couv', prenomCouv || prenom);
+  if (fCouv) fd.append('couverture', fCouv);
 
   const res  = await fetch('/ajouter-bd', { method:'POST', body:fd });
   const data = await res.json();
   if (data.erreur) { affMsg(msgEl, data.erreur, 'err'); return; }
   affMsg(msgEl, '✓ BD ajoutée !', 'ok');
-  inputPdf.value = ''; zoneUp.classList.remove('ok');
+
+  // Reset
+  inputPdf.value = '';
+  document.getElementById('input-couv-biblio').value = '';
+  zoneUp.classList.remove('ok');
+  document.getElementById('zone-couv-biblio').classList.remove('ok');
   nomFich.style.display = 'none';
+  document.getElementById('nom-couv-fich').style.display = 'none';
   document.getElementById('nom-bd').value = '';
   document.getElementById('prenom-bd').value = '';
-  document.getElementById('prompt-biblio').value = '';
+  document.getElementById('prenom-couv-bd').value = '';
   chargerListe(); chargerSelectBD();
 }
 
@@ -657,7 +531,7 @@ async function chargerListe() {
       <div>
         <div class="bd-nom">📖 ${bd.nom}</div>
         <div class="bd-prenom">Héros : ${bd.prenom}</div>
-        ${bd.prompt_couv ? '<div class="bd-couv">🎨 Prompt couverture enregistré</div>' : ''}
+        ${bd.couverture ? '<div class="bd-couv">🎨 Couverture PDF incluse</div>' : ''}
       </div>
       <button class="bd-suppr" onclick="supprimerBD('${bd.id}')">🗑</button>
     </div>`).join('');
@@ -717,15 +591,11 @@ function doneStep(id) {
 async function generer() {
   const bdId    = document.getElementById('select-bd').value;
   const nouveau = document.getElementById('prenom-nouveau').value.trim();
-  const avecCouv = document.getElementById('toggle-couv').checked;
-  const prompt   = document.getElementById('prompt-couv').value.trim();
-  const inputCouv = document.getElementById('input-couv');
-  const errEl    = document.getElementById('err-perso');
+  const errEl = document.getElementById('err-perso');
   errEl.className = 'msg err';
 
   if (!bdId)    { affMsg(errEl,'Sélectionne une BD.','err'); return; }
   if (!nouveau) { affMsg(errEl,"Entre le prénom de l'enfant.",'err'); return; }
-  if (avecCouv && !prompt) { affMsg(errEl,'Entre un prompt pour la couverture.','err'); return; }
 
   document.getElementById('btn-gen').disabled = true;
   document.getElementById('loader').classList.add('actif');
@@ -737,31 +607,14 @@ async function generer() {
   setStep('step-bd');
 
   try {
-    // Préparer la requête (FormData pour gérer l'image de couverture)
-    const fd = new FormData();
-    fd.append('bd_id', bdId);
-    fd.append('prenom_nouveau', nouveau);
-    fd.append('avec_couverture', avecCouv ? '1' : '0');
-    fd.append('prompt_couverture', prompt);
-    fd.append('compression', compression);
+    const res = await fetch('/generer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bd_id: bdId, prenom_nouveau: nouveau, compression })
+    });
 
-    // Couverture image manuelle
-    const inputCouv = document.getElementById('input-couv');
-    if (!avecCouv && inputCouv.files[0]) {
-      fd.append('couverture_image', inputCouv.files[0]);
-    }
-
-    const res = await fetch('/generer', { method: 'POST', body: fd });
-
-    // Simuler progression visuelle
-    if (avecCouv) {
-      setTimeout(() => { doneStep('step-bd'); setStep('step-couv'); }, 800);
-      setTimeout(() => { doneStep('step-couv'); setStep('step-assemble'); }, 8000);
-      setTimeout(() => { doneStep('step-assemble'); setStep('step-compress'); }, 9500);
-    } else {
-      setTimeout(() => { doneStep('step-bd'); setStep('step-assemble'); }, 800);
-      setTimeout(() => { doneStep('step-assemble'); setStep('step-compress'); }, 1500);
-    }
+    setTimeout(() => { doneStep('step-bd'); setStep('step-assemble'); }, 800);
+    setTimeout(() => { doneStep('step-assemble'); setStep('step-compress'); }, 1500);
 
     const data = await res.json();
     if (!res.ok || data.erreur) { affMsg(errEl, data.erreur || 'Erreur.', 'err'); return; }
@@ -775,7 +628,7 @@ async function generer() {
     const prenom_cap = nouveau.charAt(0).toUpperCase() + nouveau.slice(1).toLowerCase();
     document.getElementById('res-titre').textContent = `PDF de ${prenom_cap} prêt ! 🎉`;
     document.getElementById('res-info').textContent =
-      `${data.pages} pages · ${data.avec_couverture ? 'Couverture IA incluse · ' : ''}Compression ${compression}`;
+      `${data.pages} pages · ${data.avec_couverture ? 'Couverture incluse · ' : ''}Compression ${compression}`;
     document.getElementById('res-taille').textContent = `📦 ${data.taille_mo} Mo`;
     document.getElementById('btn-dl').href = '/telecharger/' + data.fichier;
     document.getElementById('btn-dl').download = `BD_${prenom_cap}.pdf`;
@@ -802,9 +655,6 @@ function affMsg(el, txt, cls) {
 
 // Init
 chargerSelectBD();
-// Couverture upload visible par défaut (toggle IA = OFF)
-document.getElementById('couv-upload').classList.add('visible');
-document.getElementById('toggle-row').classList.add('open');
 </script>
 </body>
 </html>"""
@@ -819,21 +669,36 @@ def index():
 
 @app.route("/ajouter-bd", methods=["POST"])
 def ajouter_bd():
-    fichier     = request.files.get("pdf")
-    nom         = request.form.get("nom","").strip()
-    prenom      = request.form.get("prenom","").strip().upper()
-    prompt_couv = request.form.get("prompt_couv","").strip()
+    fichier      = request.files.get("pdf")
+    couv_fichier = request.files.get("couverture")
+    nom          = request.form.get("nom","").strip()
+    prenom_bd    = request.form.get("prenom","").strip().upper()
+    prenom_couv  = request.form.get("prenom_couv","").strip().upper()
 
-    if not fichier or not nom or not prenom:
+    if not fichier or not nom or not prenom_bd:
         return jsonify({"erreur":"Données manquantes"}), 400
 
     bd_id = uuid.uuid4().hex[:10]
-    chemin = os.path.join(BIBLIO_FOLDER, f"{bd_id}.pdf")
-    fichier.save(chemin)
+
+    # Sauvegarder les pages BD
+    chemin_bd = os.path.join(BIBLIO_FOLDER, f"{bd_id}_bd.pdf")
+    fichier.save(chemin_bd)
+
+    # Sauvegarder la couverture si fournie
+    chemin_couv = None
+    if couv_fichier:
+        chemin_couv = os.path.join(BIBLIO_FOLDER, f"{bd_id}_couv.pdf")
+        couv_fichier.save(chemin_couv)
 
     meta = lire_meta()
-    meta[bd_id] = {"id":bd_id,"nom":nom,"prenom":prenom,
-                   "fichier":f"{bd_id}.pdf","prompt_couv":prompt_couv}
+    meta[bd_id] = {
+        "id": bd_id,
+        "nom": nom,
+        "prenom": prenom_bd,
+        "prenom_couv": prenom_couv or prenom_bd,
+        "fichier": f"{bd_id}_bd.pdf",
+        "couverture": f"{bd_id}_couv.pdf" if chemin_couv else None
+    }
     ecrire_meta(meta)
     return jsonify({"succes":True,"id":bd_id})
 
@@ -853,101 +718,57 @@ def supprimer_bd(bd_id):
 
 @app.route("/generer", methods=["POST"])
 def generer():
-    # Accepte FormData (pour l'image de couverture)
-    bd_id          = request.form.get("bd_id","")
-    prenom_nouveau = request.form.get("prenom_nouveau","").strip()
-    avec_couv      = request.form.get("avec_couverture","0") == "1"
-    prompt_couv    = request.form.get("prompt_couverture","").strip()
-    compression    = request.form.get("compression","moyenne")
-    couv_image     = request.files.get("couverture_image")
+    data           = request.json
+    bd_id          = data.get("bd_id","")
+    prenom_nouveau = data.get("prenom_nouveau","").strip()
+    compression    = data.get("compression","moyenne")
 
     meta = lire_meta()
     if bd_id not in meta:
         return jsonify({"erreur":"BD introuvable"}), 404
 
-    bd = meta[bd_id]
-    chemin_pdf    = os.path.join(BIBLIO_FOLDER, bd["fichier"])
+    bd            = meta[bd_id]
+    chemin_bd     = os.path.join(BIBLIO_FOLDER, bd["fichier"])
     prenom_ancien = bd["prenom"]
 
-    # ── 1. Personnaliser la BD ──
+    docs_a_assembler = []
+
+    # ── 1. Personnaliser la couverture (si elle existe) ────────────────────
+    if bd.get("couverture"):
+        chemin_couv = os.path.join(BIBLIO_FOLDER, bd["couverture"])
+        if os.path.exists(chemin_couv):
+            try:
+                prenom_couv_ancien = bd.get("prenom_couv", prenom_ancien)
+                doc_couv, _ = personnaliser_pdf_pages(chemin_couv, prenom_couv_ancien, prenom_nouveau)
+                docs_a_assembler.append(doc_couv)
+            except Exception as e:
+                return jsonify({"erreur": f"Erreur couverture : {str(e)}"}), 500
+
+    # ── 2. Personnaliser les pages BD ──────────────────────────────────────
     try:
-        doc_bd, nb = personnaliser_pdf_pages(chemin_pdf, prenom_ancien, prenom_nouveau)
+        doc_bd, nb = personnaliser_pdf_pages(chemin_bd, prenom_ancien, prenom_nouveau)
+        docs_a_assembler.append(doc_bd)
     except Exception as e:
         return jsonify({"erreur": f"Erreur BD : {str(e)}"}), 500
 
     if nb == 0:
         return jsonify({"erreur": f"'{prenom_ancien}' introuvable dans le PDF"}), 404
 
-    # ── 2. Couverture ──
-    chemin_couv = None
-    if avec_couv:
-        # Mode IA : génération GPT-Image
-        prompt = prompt_couv or bd.get("prompt_couv","")
-        if not prompt:
-            return jsonify({"erreur":"Prompt couverture manquant"}), 400
-        if not POYO_API_KEY:
-            return jsonify({"erreur":"Clé Poyo non configurée (variable POYO_API_KEY)"}), 500
-        try:
-            chemin_couv = generer_couverture(prompt, prenom_nouveau)
-        except Exception as e:
-            return jsonify({"erreur": f"Erreur couverture IA : {str(e)}"}), 500
-    elif couv_image:
-        # Mode Manuel : image uploadée → convertie en PNG temporaire
-        try:
-            import tempfile
-            from PIL import Image as PILImage
-            ext = couv_image.filename.rsplit(".",1)[-1].lower()
-            chemin_tmp = f"/tmp/couv_upload_{uuid.uuid4().hex[:8]}.{ext}"
-            couv_image.save(chemin_tmp)
-            # Convertir en PNG si besoin (PyMuPDF accepte PNG/JPEG/PDF)
-            if ext in ("jpg","jpeg","png","webp"):
-                img = PILImage.open(chemin_tmp).convert("RGB")
-                chemin_couv = f"/tmp/couv_{uuid.uuid4().hex[:8]}.png"
-                img.save(chemin_couv, "PNG")
-                os.remove(chemin_tmp)
-            elif ext == "pdf":
-                chemin_couv = chemin_tmp  # déjà un PDF, géré séparément
-            else:
-                return jsonify({"erreur":"Format couverture non supporté"}), 400
-        except Exception as e:
-            return jsonify({"erreur": f"Erreur couverture image : {str(e)}"}), 500
-
-    # ── 3. Assembler ──
+    # ── 3. Assembler ───────────────────────────────────────────────────────
     try:
-        if chemin_couv and chemin_couv.endswith(".pdf"):
-            # Couverture déjà en PDF → insérer directement
-            doc_couv = fitz.open(chemin_couv)
-            pdf_final = fitz.open()
-            pdf_final.insert_pdf(doc_couv)
-            pdf_final.insert_pdf(doc_bd)
-            nom = f"BD_{prenom_nouveau.capitalize()}_{uuid.uuid4().hex[:6]}.pdf"
-            chemin_final = os.path.join(OUTPUT_FOLDER, nom)
-            if compression == "forte":
-                pdf_final.save(chemin_final, garbage=4, deflate=True, clean=True, deflate_images=True, deflate_fonts=True)
-            elif compression == "moyenne":
-                pdf_final.save(chemin_final, garbage=3, deflate=True, clean=True)
-            else:
-                pdf_final.save(chemin_final)
-        elif chemin_couv:
-            chemin_final = assembler_pdf(chemin_couv, doc_bd, prenom_nouveau, compression)
-        else:
-            chemin_final = assembler_pdf_sans_couverture(doc_bd, prenom_nouveau, compression)
+        chemin_final = assembler_pdf(docs_a_assembler, prenom_nouveau, compression)
     except Exception as e:
         return jsonify({"erreur": f"Erreur assemblage : {str(e)}"}), 500
-    finally:
-        if chemin_couv and os.path.exists(chemin_couv):
-            os.remove(chemin_couv)
 
     taille_mo = round(os.path.getsize(chemin_final) / (1024*1024), 1)
-    doc_final = fitz.open(chemin_final)
-    nb_pages  = len(doc_final)
+    nb_pages  = len(fitz.open(chemin_final))
 
     return jsonify({
         "succes": True,
         "fichier": os.path.basename(chemin_final),
         "taille_mo": taille_mo,
         "pages": nb_pages,
-        "avec_couverture": avec_couv
+        "avec_couverture": bool(bd.get("couverture"))
     })
 
 @app.route("/telecharger/<nom>")
