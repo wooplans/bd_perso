@@ -119,30 +119,71 @@ def adapter_casse(prenom_nouveau, texte, prenom_ancien):
         return prenom_nouveau.lower()
     return re.compile(re.escape(prenom_ancien), re.IGNORECASE).sub(remplacer, texte)
 
+def est_bloc_centre(bloc, tolerance=2.0):
+    """
+    Détecte si un bloc Canva est centré.
+    Canva centre chaque ligne autour d'un même point X fixe.
+    On vérifie que tous les centres X des lignes sont identiques (± tolérance).
+    """
+    centres = []
+    for line in bloc["lines"]:
+        for span in line["spans"]:
+            if span["text"].strip():
+                bbox = span["bbox"]
+                centres.append((bbox[0] + bbox[2]) / 2)
+    if len(centres) < 2:
+        return False, 0
+    centre_ref = centres[0]
+    if all(abs(c - centre_ref) <= tolerance for c in centres):
+        return True, centre_ref
+    return False, 0
+
+
+def largeur_texte(texte, fontfile, fontsize):
+    """Mesure la largeur d'un texte avec une police et taille données."""
+    try:
+        doc_tmp = fitz.open()
+        page_tmp = doc_tmp.new_page(width=2000, height=100)
+        rc = page_tmp.insert_text((10, 50), texte, fontfile=fontfile, fontsize=fontsize)
+        # PyMuPDF retourne le nombre de caractères insérés
+        # On utilise get_text pour mesurer la bbox réelle
+        blocks = page_tmp.get_text("dict")["blocks"]
+        for b in blocks:
+            if b["type"] == 0:
+                for line in b["lines"]:
+                    for span in line["spans"]:
+                        if texte.strip() in span["text"].strip() or span["text"].strip() in texte.strip():
+                            return span["bbox"][2] - span["bbox"][0]
+    except Exception:
+        pass
+    # Estimation fallback : ~0.6 * fontsize par caractère
+    return len(texte) * fontsize * 0.6
+
+
 def personnaliser_pdf_pages(chemin_pdf, prenom_ancien, prenom_nouveau):
     doc = fitz.open(chemin_pdf)
-    # Extraire TOUTES les polices du PDF en une seule passe
     cache_polices = extraire_polices_pdf(doc)
     total = 0
 
     for page in doc:
-        blocs_a_reecrire = []
-
+        # Collecter les blocs à réécrire avec leur info de centrage
+        blocs_info = []
         for bloc in page.get_text("dict")["blocks"]:
             if bloc["type"] != 0:
                 continue
-            # Vérifier si le prénom apparaît dans ce bloc (n'importe quelle ligne)
             if not any(prenom_ancien.upper() in span["text"].upper()
                        for line in bloc["lines"] for span in line["spans"]):
                 continue
-            # Collecter tous les spans du bloc
-            blocs_a_reecrire.append([
-                span for line in bloc["lines"] for span in line["spans"]
-            ])
+            centre, centre_x = est_bloc_centre(bloc)
+            blocs_info.append({
+                "spans": [span for line in bloc["lines"] for span in line["spans"]],
+                "centre": centre,
+                "centre_x": centre_x
+            })
 
-        # ── Étape 1 : effacer tous les spans des blocs ciblés ──────────────
-        for spans_bloc in blocs_a_reecrire:
-            for span in spans_bloc:
+        # ── Étape 1 : effacer ──────────────────────────────────────────────
+        for info in blocs_info:
+            for span in info["spans"]:
                 bbox = fitz.Rect(span["bbox"])
                 page.add_redact_annot(
                     fitz.Rect(bbox.x0-1, bbox.y0-1, bbox.x1+1, bbox.y1+1),
@@ -150,18 +191,36 @@ def personnaliser_pdf_pages(chemin_pdf, prenom_ancien, prenom_nouveau):
                 )
         page.apply_redactions()
 
-        # ── Étape 2 : réécrire avec la police exacte de chaque span ────────
-        for spans_bloc in blocs_a_reecrire:
-            for span in spans_bloc:
+        # ── Étape 2 : réécrire avec centrage si nécessaire ─────────────────
+        for info in blocs_info:
+            for span in info["spans"]:
                 texte_nouveau = adapter_casse(prenom_nouveau, span["text"], prenom_ancien)
                 police = police_pour_span(span, cache_polices)
-                page.insert_text(
-                    span["origin"],
-                    texte_nouveau,
-                    fontfile=police,
-                    fontsize=span["size"],  # taille exacte préservée
-                    color=(0, 0, 0)
-                )
+                taille = span["size"]
+
+                if info["centre"] and prenom_ancien.upper() in span["text"].upper():
+                    # ── Texte centré : recalculer le X de départ ──────────
+                    centre_x = info["centre_x"]
+                    w = largeur_texte(texte_nouveau, police, taille)
+                    x_depart = centre_x - (w / 2)
+                    # Garder le Y original (baseline)
+                    y_depart = span["origin"][1]
+                    page.insert_text(
+                        (x_depart, y_depart),
+                        texte_nouveau,
+                        fontfile=police,
+                        fontsize=taille,
+                        color=(0, 0, 0)
+                    )
+                else:
+                    # ── Texte non centré : position originale ─────────────
+                    page.insert_text(
+                        span["origin"],
+                        texte_nouveau,
+                        fontfile=police,
+                        fontsize=taille,
+                        color=(0, 0, 0)
+                    )
                 total += 1
 
     return doc, total
