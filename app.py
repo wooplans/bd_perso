@@ -304,7 +304,11 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 .msg.ok{background:rgba(6,214,160,.07);border:2px solid rgba(6,214,160,.22);color:#059669}
 
 .sep{height:1px;background:rgba(108,60,225,.08);margin:14px 0}
+.progress-wrap{border-radius:10px;overflow:hidden;background:rgba(108,60,225,.08);height:8px;position:relative}
+.progress-bar{height:100%;background:linear-gradient(90deg,var(--violet),var(--vert));width:0%;transition:width .3s;border-radius:10px}
+.progress-label{font-size:.75rem;font-weight:700;color:var(--doux);text-align:center;margin-top:6px}
 .footer{text-align:center;font-size:.72rem;color:var(--doux);opacity:.5;font-weight:600}
+.version-badge{display:inline-block;margin-top:6px;font-size:.7rem;font-weight:800;color:var(--doux);opacity:.5;background:rgba(108,60,225,.08);padding:2px 10px;border-radius:20px;letter-spacing:.5px}
 </style>
 </head>
 <body>
@@ -314,7 +318,8 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
   <div class="header">
     <div class="badge">EnfantProdige</div>
     <h1 class="titre">BD <span>Personnalisée</span></h1>
-    <p class="sous-titre">Couverture IA + BD personnalisée = PDF prêt à envoyer ✨</p>
+    <p class="sous-titre">Couverture + BD personnalisée = PDF prêt à envoyer ✨</p>
+    <div class="version-badge">v11/05/2026 14:05</div>
   </div>
 
   <!-- Onglets -->
@@ -407,7 +412,20 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
     <label class="label">Prénom placeholder sur la couverture</label>
     <input type="text" class="champ-nom" id="prenom-couv-bd" placeholder="Ex : WILLIAM (laisser vide = même que pages)">
 
-    <button class="btn-sm" onclick="uploadBD()">➕ Ajouter à la bibliothèque</button>
+    <label class="label">Type de couverture</label>
+    <div class="comp-row" style="margin-bottom:16px">
+      <button class="comp-btn actif" id="btn-couv-sep" onclick="setTypeCouv('separee',this)">📄 Fichier séparé</button>
+      <button class="comp-btn" id="btn-couv-int" onclick="setTypeCouv('integree',this)">📋 Intégrée au doc</button>
+    </div>
+    <div id="hint-type-couv" style="font-size:.72rem;color:var(--doux);margin-top:-12px;margin-bottom:14px">
+      La couverture est un PDF Canva séparé des pages
+    </div>
+
+    <button class="btn-sm" id="btn-upload-bd" onclick="uploadBD()">➕ Ajouter à la bibliothèque</button>
+    <div class="progress-wrap" id="progress-wrap" style="display:none;margin-top:12px">
+      <div class="progress-bar" id="progress-bar"></div>
+      <div class="progress-label" id="progress-label">Upload en cours…</div>
+    </div>
     <div class="msg" id="msg-upload"></div>
 
     <div class="sep"></div>
@@ -480,6 +498,26 @@ zoneUp.addEventListener('drop', e => {
   }
 });
 
+let typeCouv = 'separee';
+
+function setTypeCouv(val, btn) {
+  typeCouv = val;
+  document.querySelectorAll('#btn-couv-sep, #btn-couv-int').forEach(b => b.classList.remove('actif'));
+  btn.classList.add('actif');
+  document.getElementById('hint-type-couv').textContent =
+    val === 'separee'
+      ? 'La couverture est un PDF Canva séparé des pages'
+      : 'La couverture est déjà incluse comme première page du document';
+  // Masquer la zone upload couverture si intégrée
+  document.getElementById('zone-couv-biblio').style.opacity = val === 'integree' ? '.4' : '1';
+  document.getElementById('zone-couv-biblio').style.pointerEvents = val === 'integree' ? 'none' : 'auto';
+}
+
+function setProgress(pct, label) {
+  document.getElementById('progress-bar').style.width = pct + '%';
+  document.getElementById('progress-label').textContent = label;
+}
+
 async function uploadBD() {
   const f      = inputPdf.files[0];
   const fCouv  = document.getElementById('input-couv-biblio').files[0];
@@ -487,35 +525,67 @@ async function uploadBD() {
   const prenom = document.getElementById('prenom-bd').value.trim();
   const prenomCouv = document.getElementById('prenom-couv-bd').value.trim();
   const msgEl  = document.getElementById('msg-upload');
+  const btn    = document.getElementById('btn-upload-bd');
   msgEl.className = 'msg';
 
   if (!f)     { affMsg(msgEl,'Choisis le PDF des pages.','err'); return; }
   if (!nom)   { affMsg(msgEl,'Donne un nom à cette BD.','err'); return; }
   if (!prenom){ affMsg(msgEl,'Indique le prénom placeholder.','err'); return; }
 
+  // UI → chargement
+  btn.disabled = true;
+  btn.textContent = '⏳ Upload en cours…';
+  document.getElementById('progress-wrap').style.display = 'block';
+  setProgress(10, 'Préparation…');
+
   const fd = new FormData();
   fd.append('pdf', f);
   fd.append('nom', nom);
   fd.append('prenom', prenom);
   fd.append('prenom_couv', prenomCouv || prenom);
-  if (fCouv) fd.append('couverture', fCouv);
+  fd.append('type_couv', typeCouv);
+  if (fCouv && typeCouv === 'separee') fd.append('couverture', fCouv);
 
-  const res  = await fetch('/ajouter-bd', { method:'POST', body:fd });
-  const data = await res.json();
-  if (data.erreur) { affMsg(msgEl, data.erreur, 'err'); return; }
-  affMsg(msgEl, '✓ BD ajoutée !', 'ok');
+  setProgress(30, 'Envoi du fichier…');
 
-  // Reset
-  inputPdf.value = '';
-  document.getElementById('input-couv-biblio').value = '';
-  zoneUp.classList.remove('ok');
-  document.getElementById('zone-couv-biblio').classList.remove('ok');
-  nomFich.style.display = 'none';
-  document.getElementById('nom-couv-fich').style.display = 'none';
-  document.getElementById('nom-bd').value = '';
-  document.getElementById('prenom-bd').value = '';
-  document.getElementById('prenom-couv-bd').value = '';
-  chargerListe(); chargerSelectBD();
+  try {
+    const res  = await fetch('/ajouter-bd', { method:'POST', body:fd });
+    setProgress(80, 'Traitement…');
+    const data = await res.json();
+
+    if (data.erreur) {
+      affMsg(msgEl, data.erreur, 'err');
+      setProgress(0, '');
+      document.getElementById('progress-wrap').style.display = 'none';
+      return;
+    }
+
+    setProgress(100, '✓ BD ajoutée avec succès !');
+    setTimeout(() => {
+      document.getElementById('progress-wrap').style.display = 'none';
+      affMsg(msgEl, '✓ BD ajoutée à la bibliothèque !', 'ok');
+    }, 600);
+
+    // Reset
+    inputPdf.value = '';
+    document.getElementById('input-couv-biblio').value = '';
+    zoneUp.classList.remove('ok');
+    document.getElementById('zone-couv-biblio').classList.remove('ok');
+    nomFich.style.display = 'none';
+    document.getElementById('nom-couv-fich').style.display = 'none';
+    document.getElementById('nom-bd').value = '';
+    document.getElementById('prenom-bd').value = '';
+    document.getElementById('prenom-couv-bd').value = '';
+    chargerListe(); chargerSelectBD();
+
+  } catch(e) {
+    affMsg(msgEl, 'Erreur de connexion.', 'err');
+    setProgress(0,'');
+    document.getElementById('progress-wrap').style.display = 'none';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '➕ Ajouter à la bibliothèque';
+  }
 }
 
 // ── Liste bibliothèque ────────────────────────────────────────────────────────
@@ -692,12 +762,13 @@ def ajouter_bd():
 
     meta = lire_meta()
     meta[bd_id] = {
-        "id": bd_id,
-        "nom": nom,
-        "prenom": prenom_bd,
+        "id":          bd_id,
+        "nom":         nom,
+        "prenom":      prenom_bd,
         "prenom_couv": prenom_couv or prenom_bd,
-        "fichier": f"{bd_id}_bd.pdf",
-        "couverture": f"{bd_id}_couv.pdf" if chemin_couv else None
+        "pages":       f"{bd_id}_bd.pdf",
+        "couverture":  f"{bd_id}_couv.pdf" if chemin_couv else None,
+        "type_couv":   request.form.get("type_couv", "separee")
     }
     ecrire_meta(meta)
     return jsonify({"succes":True,"id":bd_id})
@@ -728,23 +799,29 @@ def generer():
         return jsonify({"erreur":"BD introuvable"}), 404
 
     bd            = meta[bd_id]
-    chemin_bd     = os.path.join(BIBLIO_FOLDER, bd["fichier"])
+    # Support ancien format ("fichier") et nouveau ("pages")
+    nom_pages     = bd.get("pages") or bd.get("fichier","")
+    chemin_bd     = os.path.join(BIBLIO_FOLDER, nom_pages)
     prenom_ancien = bd["prenom"]
+    type_couv     = bd.get("type_couv", "separee")
+
+    if not os.path.exists(chemin_bd):
+        return jsonify({"erreur": f"Fichier BD introuvable : {nom_pages}"}), 404
 
     docs_a_assembler = []
 
-    # ── 1. Personnaliser la couverture (si elle existe) ────────────────────
-    if bd.get("couverture"):
+    # ── 1. Couverture séparée (PDF Canva personnalisé) ─────────────────────
+    if bd.get("couverture") and type_couv == "separee":
         chemin_couv = os.path.join(BIBLIO_FOLDER, bd["couverture"])
         if os.path.exists(chemin_couv):
             try:
-                prenom_couv_ancien = bd.get("prenom_couv", prenom_ancien)
+                prenom_couv_ancien = bd.get("prenom_couv") or prenom_ancien
                 doc_couv, _ = personnaliser_pdf_pages(chemin_couv, prenom_couv_ancien, prenom_nouveau)
                 docs_a_assembler.append(doc_couv)
             except Exception as e:
                 return jsonify({"erreur": f"Erreur couverture : {str(e)}"}), 500
 
-    # ── 2. Personnaliser les pages BD ──────────────────────────────────────
+    # ── 2. Pages BD (couverture intégrée ou séparée) ───────────────────────
     try:
         doc_bd, nb = personnaliser_pdf_pages(chemin_bd, prenom_ancien, prenom_nouveau)
         docs_a_assembler.append(doc_bd)
@@ -764,11 +841,11 @@ def generer():
     nb_pages  = len(fitz.open(chemin_final))
 
     return jsonify({
-        "succes": True,
-        "fichier": os.path.basename(chemin_final),
-        "taille_mo": taille_mo,
-        "pages": nb_pages,
-        "avec_couverture": bool(bd.get("couverture"))
+        "succes":           True,
+        "fichier":          os.path.basename(chemin_final),
+        "taille_mo":        taille_mo,
+        "pages":            nb_pages,
+        "avec_couverture":  bool(bd.get("couverture"))
     })
 
 @app.route("/telecharger/<nom>")
