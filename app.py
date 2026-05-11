@@ -119,11 +119,11 @@ def adapter_casse(prenom_nouveau, texte, prenom_ancien):
         return prenom_nouveau.lower()
     return re.compile(re.escape(prenom_ancien), re.IGNORECASE).sub(remplacer, texte)
 
-def est_bloc_centre(bloc, tolerance=2.0):
+def est_bloc_centre(bloc, page_largeur=595.0, tol_multi=3.0, tol_page=5.0):
     """
-    Détecte si un bloc Canva est centré.
-    Canva centre chaque ligne autour d'un même point X fixe.
-    On vérifie que tous les centres X des lignes sont identiques (± tolérance).
+    Détecte si un bloc Canva est centré. Deux cas :
+    1. Plusieurs lignes → toutes ont le même centre X (± tol_multi)
+    2. Une seule ligne  → son centre X ≈ centre de la page (± tol_page)
     """
     centres = []
     for line in bloc["lines"]:
@@ -131,33 +131,115 @@ def est_bloc_centre(bloc, tolerance=2.0):
             if span["text"].strip():
                 bbox = span["bbox"]
                 centres.append((bbox[0] + bbox[2]) / 2)
-    if len(centres) < 2:
+
+    if not centres:
         return False, 0
-    centre_ref = centres[0]
-    if all(abs(c - centre_ref) <= tolerance for c in centres):
-        return True, centre_ref
+
+    # ── Plusieurs lignes ──────────────────────────────────────────────────
+    if len(centres) >= 2:
+        ref = centres[0]
+        if all(abs(c - ref) <= tol_multi for c in centres):
+            return True, ref
+        return False, 0
+
+    # ── Une seule ligne → centré sur la page ? ────────────────────────────
+    centre_page = page_largeur / 2
+    if abs(centres[0] - centre_page) <= tol_page:
+        return True, centre_page
+
     return False, 0
 
 
-def largeur_texte(texte, fontfile, fontsize):
-    """Mesure la largeur d'un texte avec une police et taille données."""
+
+def zone_effacement(page, span, police, taille):
+    """
+    Calcule la zone exacte à effacer pour un span de texte centré.
+    
+    Stratégie :
+    - Horizontalement : toute la largeur de la zone blanche détectée par pixels
+    - Verticalement   : baseline ± marges calculées depuis les métriques réelles
+    """
+    try:
+        import numpy as np
+        bbox  = span["bbox"]
+        orig  = span["origin"]  # orig[1] = baseline Y
+
+        # ── 1. Largeur : détecter la zone blanche horizontalement ─────────
+        # Chercher sur une ligne horizontale au niveau de la baseline
+        y_scan = orig[1] - (orig[1] - bbox[1]) * 0.5  # milieu du texte
+        zone_h = fitz.Rect(0, y_scan - 2, page.rect.width, y_scan + 2)
+        mat = fitz.Matrix(3, 3)
+        pix_h = page.get_pixmap(matrix=mat, clip=zone_h)
+        img_h = pix_h.tobytes("png")
+        from PIL import Image
+        import io
+        img = Image.open(io.BytesIO(img_h))
+        arr = np.array(img)
+        masque_h = (arr[:,:,0]>245)&(arr[:,:,1]>245)&(arr[:,:,2]>245)
+        cols = np.where(masque_h.any(axis=0))[0]
+        if len(cols) > 10:
+            x0 = cols[0]  / 3.0
+            x1 = cols[-1] / 3.0
+        else:
+            x0 = bbox[0] - 5
+            x1 = bbox[2] + 5
+
+        # ── 2. Hauteur : scanner verticalement sur la largeur détectée ────
+        zone_v = fitz.Rect(x0 + 10, max(0, bbox[1]-30),
+                           x1 - 10, min(page.rect.height, bbox[3]+30))
+        pix_v = page.get_pixmap(matrix=mat, clip=zone_v)
+        arr_v = np.array(Image.open(io.BytesIO(pix_v.tobytes("png"))))
+        masque_v = (arr_v[:,:,0]>245)&(arr_v[:,:,1]>245)&(arr_v[:,:,2]>245)
+        # Garder uniquement les rangées avec >50% de pixels blancs
+        seuil = arr_v.shape[1] * 0.5
+        dense = np.where(masque_v.sum(axis=1) > seuil)[0]
+        if len(dense) > 3:
+            y0 = zone_v.y0 + dense[0]  / 3.0
+            y1 = zone_v.y0 + dense[-1] / 3.0
+        else:
+            y0 = orig[1] - (orig[1] - bbox[1]) * 0.85
+            y1 = orig[1] + (bbox[3] - orig[1])
+
+        return fitz.Rect(x0, y0, x1, y1)
+
+    except Exception:
+        # Fallback : bbox exacte du texte sans marge verticale
+        orig = span["origin"]
+        _, asc, desc = mesurer_texte(span["text"], police, taille)
+        w = largeur_texte(span["text"], police, taille)
+        return fitz.Rect(orig[0]-5, orig[1]-asc, orig[0]+w+5, orig[1]+desc)
+
+
+def mesurer_texte(texte, fontfile, fontsize):
+    """
+    Mesure la bbox exacte d'un texte rendu avec une police et taille données.
+    Retourne (largeur, ascendant, descendant) en pixels.
+    """
     try:
         doc_tmp = fitz.open()
-        page_tmp = doc_tmp.new_page(width=2000, height=100)
-        rc = page_tmp.insert_text((10, 50), texte, fontfile=fontfile, fontsize=fontsize)
-        # PyMuPDF retourne le nombre de caractères insérés
-        # On utilise get_text pour mesurer la bbox réelle
-        blocks = page_tmp.get_text("dict")["blocks"]
-        for b in blocks:
+        page_tmp = doc_tmp.new_page(width=2000, height=300)
+        baseline_y = 150
+        page_tmp.insert_text((10, baseline_y), texte, fontfile=fontfile, fontsize=fontsize)
+        for b in page_tmp.get_text("dict")["blocks"]:
             if b["type"] == 0:
                 for line in b["lines"]:
                     for span in line["spans"]:
-                        if texte.strip() in span["text"].strip() or span["text"].strip() in texte.strip():
-                            return span["bbox"][2] - span["bbox"][0]
+                        t = span["text"].strip()
+                        if texte.strip() in t or t in texte.strip():
+                            bbox = span["bbox"]
+                            orig = span["origin"]
+                            largeur    = bbox[2] - bbox[0]
+                            ascendant  = orig[1] - bbox[1]
+                            descendant = bbox[3] - orig[1]
+                            return largeur, ascendant, descendant
     except Exception:
         pass
-    # Estimation fallback : ~0.6 * fontsize par caractère
-    return len(texte) * fontsize * 0.6
+    return len(texte) * fontsize * 0.6, fontsize * 0.75, fontsize * 0.2
+
+def largeur_texte(texte, fontfile, fontsize):
+    """Wrapper — retourne uniquement la largeur."""
+    return mesurer_texte(texte, fontfile, fontsize)[0]
+
 
 
 def personnaliser_pdf_pages(chemin_pdf, prenom_ancien, prenom_nouveau):
@@ -174,7 +256,7 @@ def personnaliser_pdf_pages(chemin_pdf, prenom_ancien, prenom_nouveau):
             if not any(prenom_ancien.upper() in span["text"].upper()
                        for line in bloc["lines"] for span in line["spans"]):
                 continue
-            centre, centre_x = est_bloc_centre(bloc)
+            centre, centre_x = est_bloc_centre(bloc, page.rect.width)
             blocs_info.append({
                 "spans": [span for line in bloc["lines"] for span in line["spans"]],
                 "centre": centre,
@@ -184,11 +266,10 @@ def personnaliser_pdf_pages(chemin_pdf, prenom_ancien, prenom_nouveau):
         # ── Étape 1 : effacer ──────────────────────────────────────────────
         for info in blocs_info:
             for span in info["spans"]:
-                bbox = fitz.Rect(span["bbox"])
-                page.add_redact_annot(
-                    fitz.Rect(bbox.x0-1, bbox.y0-1, bbox.x1+1, bbox.y1+1),
-                    fill=(1, 1, 1)
-                )
+                police_span = police_pour_span(span, cache_polices)
+                # Essayer de détecter la zone blanche réelle (cartouche Canva)
+                zone = zone_effacement(page, span, police_span, span["size"])
+                page.add_redact_annot(zone, fill=(1, 1, 1))
         page.apply_redactions()
 
         # ── Étape 2 : réécrire avec centrage si nécessaire ─────────────────
@@ -198,29 +279,22 @@ def personnaliser_pdf_pages(chemin_pdf, prenom_ancien, prenom_nouveau):
                 police = police_pour_span(span, cache_polices)
                 taille = span["size"]
 
+                baseline_y = span["origin"][1]
+                w, asc, desc = mesurer_texte(texte_nouveau, police, taille)
+
                 if info["centre"] and prenom_ancien.upper() in span["text"].upper():
-                    # ── Texte centré : recalculer le X de départ ──────────
-                    centre_x = info["centre_x"]
-                    w = largeur_texte(texte_nouveau, police, taille)
-                    x_depart = centre_x - (w / 2)
-                    # Garder le Y original (baseline)
-                    y_depart = span["origin"][1]
-                    page.insert_text(
-                        (x_depart, y_depart),
-                        texte_nouveau,
-                        fontfile=police,
-                        fontsize=taille,
-                        color=(0, 0, 0)
-                    )
+                    # ── Centré : recalculer X depuis le centre ────────────
+                    x_depart = info["centre_x"] - (w / 2)
                 else:
-                    # ── Texte non centré : position originale ─────────────
-                    page.insert_text(
-                        span["origin"],
-                        texte_nouveau,
-                        fontfile=police,
-                        fontsize=taille,
-                        color=(0, 0, 0)
-                    )
+                    x_depart = span["origin"][0]
+
+                page.insert_text(
+                    (x_depart, baseline_y),
+                    texte_nouveau,
+                    fontfile=police,
+                    fontsize=taille,
+                    color=(0, 0, 0)
+                )
                 total += 1
 
     return doc, total
