@@ -153,57 +153,70 @@ def est_bloc_centre(bloc, page_largeur=595.0, tol_multi=3.0, tol_page=5.0):
 
 def zone_effacement(page, span, police, taille):
     """
-    Calcule la zone exacte à effacer pour un span de texte centré.
-    
-    Stratégie :
-    - Horizontalement : toute la largeur de la zone blanche détectée par pixels
-    - Verticalement   : baseline ± marges calculées depuis les métriques réelles
+    Détecte la zone blanche exacte d'un cartouche Canva autour d'un span.
+
+    Méthode :
+    - X : scanner juste sous la baseline (zone sans texte) pour trouver
+          le segment blanc qui contient le centre du span
+    - Y : scanner verticalement sur cette largeur pour trouver les bornes
+          hautes/basses de la zone blanche (rangées >50% blanches)
     """
     try:
-        import numpy as np
-        bbox  = span["bbox"]
-        orig  = span["origin"]  # orig[1] = baseline Y
-
-        # ── 1. Largeur : détecter la zone blanche horizontalement ─────────
-        # Chercher sur une ligne horizontale au niveau de la baseline
-        y_scan = orig[1] - (orig[1] - bbox[1]) * 0.5  # milieu du texte
-        zone_h = fitz.Rect(0, y_scan - 2, page.rect.width, y_scan + 2)
-        mat = fitz.Matrix(3, 3)
-        pix_h = page.get_pixmap(matrix=mat, clip=zone_h)
-        img_h = pix_h.tobytes("png")
+        import numpy as np, io
         from PIL import Image
-        import io
-        img = Image.open(io.BytesIO(img_h))
-        arr = np.array(img)
-        masque_h = (arr[:,:,0]>245)&(arr[:,:,1]>245)&(arr[:,:,2]>245)
-        cols = np.where(masque_h.any(axis=0))[0]
-        if len(cols) > 10:
-            x0 = cols[0]  / 3.0
-            x1 = cols[-1] / 3.0
-        else:
-            x0 = bbox[0] - 5
-            x1 = bbox[2] + 5
+        bbox  = span["bbox"]
+        orig  = span["origin"]
+        mat   = fitz.Matrix(4, 4)
+        scale = 4.0
+        centre_x = (bbox[0] + bbox[2]) / 2
 
-        # ── 2. Hauteur : scanner verticalement sur la largeur détectée ────
-        zone_v = fitz.Rect(x0 + 10, max(0, bbox[1]-30),
-                           x1 - 10, min(page.rect.height, bbox[3]+30))
-        pix_v = page.get_pixmap(matrix=mat, clip=zone_v)
-        arr_v = np.array(Image.open(io.BytesIO(pix_v.tobytes("png"))))
-        masque_v = (arr_v[:,:,0]>245)&(arr_v[:,:,1]>245)&(arr_v[:,:,2]>245)
-        # Garder uniquement les rangées avec >50% de pixels blancs
-        seuil = arr_v.shape[1] * 0.5
-        dense = np.where(masque_v.sum(axis=1) > seuil)[0]
+        # ── 1. Scan horizontal sous la baseline (zone sans lettres) ───────
+        y_scan = bbox[3] - 2  # juste sous le bas de la bbox
+        zone_h = fitz.Rect(0, y_scan - 0.5, page.rect.width, y_scan + 0.5)
+        pix_h  = page.get_pixmap(matrix=mat, clip=zone_h)
+        arr_h  = np.array(Image.open(io.BytesIO(pix_h.tobytes("png"))))
+        masque_h = (arr_h[:,:,0]>240)&(arr_h[:,:,1]>240)&(arr_h[:,:,2]>240)
+
+        # Trouver le segment blanc qui contient le centre du span
+        centre_col = int(centre_x * scale)
+        x0_pdf, x1_pdf = bbox[0] - 5, bbox[2] + 5  # fallback
+        in_white, seg_start = False, 0
+        for col_i in range(masque_h.shape[1]):
+            is_w = masque_h[:, col_i].any()
+            if is_w and not in_white:
+                seg_start = col_i
+                in_white  = True
+            elif not is_w and in_white:
+                if seg_start <= centre_col <= col_i and (col_i - seg_start) > 20:
+                    x0_pdf = seg_start / scale
+                    x1_pdf = col_i    / scale
+                in_white = False
+        if in_white and seg_start <= centre_col:
+            x0_pdf = seg_start       / scale
+            x1_pdf = masque_h.shape[1] / scale
+
+        # ── 2. Scan vertical sur la largeur trouvée ────────────────────────
+        marge_v = 30
+        zone_v  = fitz.Rect(
+            x0_pdf + 10, max(0, bbox[1] - marge_v),
+            x1_pdf - 10, min(page.rect.height, bbox[3] + marge_v)
+        )
+        pix_v  = page.get_pixmap(matrix=mat, clip=zone_v)
+        arr_v  = np.array(Image.open(io.BytesIO(pix_v.tobytes("png"))))
+        masque_v = (arr_v[:,:,0]>240)&(arr_v[:,:,1]>240)&(arr_v[:,:,2]>240)
+        seuil    = arr_v.shape[1] * 0.5
+        dense    = np.where(masque_v.sum(axis=1) > seuil)[0]
+
         if len(dense) > 3:
-            y0 = zone_v.y0 + dense[0]  / 3.0
-            y1 = zone_v.y0 + dense[-1] / 3.0
+            y0_pdf = zone_v.y0 + dense[0]  / scale
+            y1_pdf = zone_v.y0 + dense[-1] / scale
         else:
-            y0 = orig[1] - (orig[1] - bbox[1]) * 0.85
-            y1 = orig[1] + (bbox[3] - orig[1])
+            y0_pdf = orig[1] - (orig[1] - bbox[1]) * 0.85
+            y1_pdf = bbox[3]
 
-        return fitz.Rect(x0, y0, x1, y1)
+        return fitz.Rect(x0_pdf, y0_pdf, x1_pdf, y1_pdf)
 
     except Exception:
-        # Fallback : bbox exacte du texte sans marge verticale
         orig = span["origin"]
         _, asc, desc = mesurer_texte(span["text"], police, taille)
         w = largeur_texte(span["text"], police, taille)
