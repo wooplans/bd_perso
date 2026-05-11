@@ -272,18 +272,12 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 .liste-vide{text-align:center;padding:20px;color:var(--doux);font-size:.85rem;font-weight:600}
 
 /* Loader */
-.loader{display:none;text-align:center;padding:14px}
+.loader{display:none;padding:16px 0}
 .loader.actif{display:block}
-.points{display:inline-flex;gap:5px;margin-bottom:7px}
-.points span{width:8px;height:8px;border-radius:50%;background:var(--violet);animation:rebond 1s ease-in-out infinite}
-.points span:nth-child(2){animation-delay:.15s;background:var(--orange)}
-.points span:nth-child(3){animation-delay:.3s;background:var(--vert)}
-@keyframes rebond{0%,80%,100%{transform:scale(.7);opacity:.5}40%{transform:scale(1.2);opacity:1}}
-.loader-steps{list-style:none;text-align:left;display:inline-block;margin-top:4px}
-.loader-steps li{font-size:.8rem;color:var(--doux);font-weight:700;padding:2px 0;opacity:.4;transition:opacity .3s}
-.loader-steps li.en-cours{opacity:1;color:var(--violet)}
-.loader-steps li.fait{opacity:.7}
-.loader-steps li.fait::before{content:"✓ ";color:var(--vert)}
+.gen-progress-wrap{height:10px;background:rgba(108,60,225,.1);border-radius:10px;overflow:hidden;margin-bottom:8px}
+.gen-progress-bar{height:100%;background:linear-gradient(90deg,var(--violet),var(--vert));width:0%;transition:width .5s ease;border-radius:10px}
+.gen-pct{font-family:'Fredoka One',cursive;font-size:1.1rem;color:var(--violet);text-align:center;margin-bottom:4px}
+.gen-msg{font-size:.82rem;font-weight:700;color:var(--doux);text-align:center;min-height:1.2em}
 
 /* Résultat */
 .resultat{display:none;text-align:center;padding:20px;border-radius:15px;background:linear-gradient(135deg,rgba(6,214,160,.07),rgba(108,60,225,.05));border:2px solid rgba(6,214,160,.22)}
@@ -357,12 +351,11 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
     <button class="btn" id="btn-gen" onclick="generer()">🚀 Générer le PDF final</button>
 
     <div class="loader" id="loader">
-      <div class="points"><span></span><span></span><span></span></div>
-      <ul class="loader-steps" id="loader-steps">
-        <li id="step-bd">Personnalisation de la BD…</li>
-        <li id="step-assemble">Assemblage du PDF…</li>
-        <li id="step-compress">Compression…</li>
-      </ul>
+      <div class="gen-progress-wrap">
+        <div class="gen-progress-bar" id="gen-bar"></div>
+      </div>
+      <div class="gen-pct" id="gen-pct">0%</div>
+      <div class="gen-msg" id="gen-msg">Initialisation…</div>
     </div>
     <div class="msg err" id="err-perso"></div>
 
@@ -635,9 +628,6 @@ function bdSelectionnee() {
   const sel = document.getElementById('select-bd');
   const opt = sel.options[sel.selectedIndex];
   document.getElementById('ap-avant').textContent = (opt?.dataset?.prenom || 'WILLIAM').toUpperCase();
-  // Pré-remplir le prompt si dispo
-  if (opt?.dataset?.prompt)
-    document.getElementById('prompt-couv').value = opt.dataset.prompt;
   majApercu();
 }
 
@@ -647,14 +637,10 @@ function majApercu() {
 }
 
 // ── Étapes loader ────────────────────────────────────────────────────────────
-function setStep(id) {
-  ['step-bd','step-couv','step-assemble','step-compress'].forEach(s => {
-    document.getElementById(s).className = '';
-  });
-  if (id) document.getElementById(id).className = 'en-cours';
-}
-function doneStep(id) {
-  if (id) document.getElementById(id).className = 'fait';
+function majProgression(pct, msg) {
+  document.getElementById('gen-bar').style.width = pct + '%';
+  document.getElementById('gen-pct').textContent = pct + '%';
+  document.getElementById('gen-msg').textContent = msg;
 }
 
 // ── Génération ────────────────────────────────────────────────────────────────
@@ -671,47 +657,70 @@ async function generer() {
   document.getElementById('loader').classList.add('actif');
   document.getElementById('resultat').classList.remove('actif');
 
-  // Afficher les étapes pertinentes
-  document.getElementById('step-couv').style.display = avecCouv ? 'list-item' : 'none';
-  document.getElementById('step-compress').style.display = compression !== 'aucune' ? 'list-item' : 'none';
-  setStep('step-bd');
+  majProgression(0, 'Démarrage…');
 
-  try {
-    const res = await fetch('/generer', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ bd_id: bdId, prenom_nouveau: nouveau, compression })
-    });
+  const prenom_cap = nouveau.charAt(0).toUpperCase() + nouveau.slice(1).toLowerCase();
 
-    setTimeout(() => { doneStep('step-bd'); setStep('step-assemble'); }, 800);
-    setTimeout(() => { doneStep('step-assemble'); setStep('step-compress'); }, 1500);
+  fetch('/generer', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ bd_id: bdId, prenom_nouveau: nouveau, compression })
+  }).then(response => {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
 
-    const data = await res.json();
-    if (!res.ok || data.erreur) { affMsg(errEl, data.erreur || 'Erreur.', 'err'); return; }
+    function lire() {
+      reader.read().then(({ done, value }) => {
+        if (done) {
+          document.getElementById('btn-gen').disabled = false;
+          return;
+        }
+        buffer += decoder.decode(value, { stream: true });
+        const blocs = buffer.split('\n\n');
+        buffer = blocs.pop();
 
-    // Succès
-    ['step-bd','step-couv','step-assemble','step-compress'].forEach(s => {
-      const el = document.getElementById(s);
-      if (el.style.display !== 'none') el.className = 'fait';
-    });
+        for (const bloc of blocs) {
+          if (!bloc.startsWith('data: ')) continue;
+          try {
+            const evt = JSON.parse(bloc.slice(6));
+            majProgression(evt.pct, evt.msg);
 
-    const prenom_cap = nouveau.charAt(0).toUpperCase() + nouveau.slice(1).toLowerCase();
-    document.getElementById('res-titre').textContent = `PDF de ${prenom_cap} prêt ! 🎉`;
-    document.getElementById('res-info').textContent =
-      `${data.pages} pages · ${data.avec_couverture ? 'Couverture incluse · ' : ''}Compression ${compression}`;
-    document.getElementById('res-taille').textContent = `📦 ${data.taille_mo} Mo`;
-    document.getElementById('btn-dl').href = '/telecharger/' + data.fichier;
-    document.getElementById('btn-dl').download = `BD_${prenom_cap}.pdf`;
-    document.getElementById('resultat').classList.add('actif');
-
-  } catch(e) {
-    affMsg(errEl, 'Erreur de connexion : ' + e.message, 'err');
-  } finally {
+            if (evt.erreur) {
+              affMsg(errEl, evt.erreur, 'err');
+              document.getElementById('btn-gen').disabled = false;
+              document.getElementById('loader').classList.remove('actif');
+              return;
+            }
+            if (evt.succes) {
+              document.getElementById('loader').classList.remove('actif');
+              document.getElementById('res-titre').textContent = 'PDF de ' + prenom_cap + ' prêt ! 🎉';
+              document.getElementById('res-info').textContent =
+                evt.pages + ' pages · ' + (evt.avec_couverture ? 'Couverture incluse · ' : '') + 'Compression ' + compression;
+              document.getElementById('res-taille').textContent = '📦 ' + evt.taille_mo + ' Mo';
+              document.getElementById('btn-dl').href = '/telecharger/' + evt.fichier;
+              document.getElementById('btn-dl').download = 'BD_' + prenom_cap + '.pdf';
+              document.getElementById('resultat').classList.add('actif');
+              document.getElementById('btn-gen').disabled = false;
+              return;
+            }
+          } catch(e) {}
+        }
+        lire();
+      }).catch(e => {
+        affMsg(errEl, 'Erreur lecture : ' + e.message, 'err');
+        document.getElementById('btn-gen').disabled = false;
+        document.getElementById('loader').classList.remove('actif');
+      });
+    }
+    lire();
+  }).catch(e => {
+    affMsg(errEl, 'Erreur : ' + e.message, 'err');
     document.getElementById('btn-gen').disabled = false;
     document.getElementById('loader').classList.remove('actif');
-    setStep(null);
-  }
+  });
 }
+
 
 function nouveau() {
   document.getElementById('resultat').classList.remove('actif');
@@ -787,6 +796,85 @@ def supprimer_bd(bd_id):
     ecrire_meta(meta)
     return jsonify({"succes":True})
 
+def _stream_generer(bd_id, prenom_nouveau, compression):
+    """Générateur SSE — envoie la progression étape par étape."""
+    import json as _json
+
+    def evt(pct, msg, data=None):
+        payload = {"pct": pct, "msg": msg}
+        if data: payload.update(data)
+        return "data: " + _json.dumps(payload, ensure_ascii=False) + "\n\n"
+
+    meta = lire_meta()
+    if bd_id not in meta:
+        yield evt(0, "Erreur", {"erreur": "BD introuvable"})
+        return
+
+    bd            = meta[bd_id]
+    nom_pages     = bd.get("pages") or bd.get("fichier","")
+    chemin_bd     = os.path.join(BIBLIO_FOLDER, nom_pages)
+    prenom_ancien = bd["prenom"]
+    type_couv     = bd.get("type_couv", "separee")
+
+    if not os.path.exists(chemin_bd):
+        yield evt(0, "Erreur", {"erreur": f"Fichier BD introuvable : {nom_pages}"})
+        return
+
+    docs_a_assembler = []
+
+    # ── Étape 1 : Couverture ───────────────────────────────────────────────
+    if bd.get("couverture") and type_couv == "separee":
+        chemin_couv = os.path.join(BIBLIO_FOLDER, bd["couverture"])
+        if os.path.exists(chemin_couv):
+            yield evt(10, "🎨 Personnalisation de la couverture…")
+            try:
+                prenom_couv_ancien = bd.get("prenom_couv") or prenom_ancien
+                doc_couv, _ = personnaliser_pdf_pages(chemin_couv, prenom_couv_ancien, prenom_nouveau)
+                docs_a_assembler.append(doc_couv)
+                yield evt(30, "✅ Couverture personnalisée")
+            except Exception as e:
+                yield evt(0, "Erreur", {"erreur": f"Erreur couverture : {str(e)}"})
+                return
+    else:
+        yield evt(10, "📄 Pas de couverture séparée…")
+
+    # ── Étape 2 : Pages BD ─────────────────────────────────────────────────
+    yield evt(35, f"📝 Remplacement de « {prenom_ancien} » par « {prenom_nouveau} »…")
+    try:
+        doc_bd, nb = personnaliser_pdf_pages(chemin_bd, prenom_ancien, prenom_nouveau)
+        docs_a_assembler.append(doc_bd)
+    except Exception as e:
+        yield evt(0, "Erreur", {"erreur": f"Erreur BD : {str(e)}"})
+        return
+
+    if nb == 0:
+        yield evt(0, "Erreur", {"erreur": f"'{prenom_ancien}' introuvable dans le PDF"})
+        return
+
+    yield evt(65, f"✅ {nb} occurrence(s) remplacée(s) dans la BD")
+
+    # ── Étape 3 : Assemblage ───────────────────────────────────────────────
+    yield evt(70, "📎 Assemblage couverture + pages…")
+    try:
+        chemin_final = assembler_pdf(docs_a_assembler, prenom_nouveau, compression)
+    except Exception as e:
+        yield evt(0, "Erreur", {"erreur": f"Erreur assemblage : {str(e)}"})
+        return
+
+    yield evt(90, f"🗜️ Compression ({compression})…")
+
+    taille_mo = round(os.path.getsize(chemin_final) / (1024*1024), 1)
+    nb_pages  = len(fitz.open(chemin_final))
+
+    yield evt(100, f"🎉 PDF prêt — {nb_pages} pages, {taille_mo} Mo", {
+        "succes":          True,
+        "fichier":         os.path.basename(chemin_final),
+        "taille_mo":       taille_mo,
+        "pages":           nb_pages,
+        "avec_couverture": bool(bd.get("couverture"))
+    })
+
+
 @app.route("/generer", methods=["POST"])
 def generer():
     data           = request.json
@@ -794,59 +882,15 @@ def generer():
     prenom_nouveau = data.get("prenom_nouveau","").strip()
     compression    = data.get("compression","moyenne")
 
-    meta = lire_meta()
-    if bd_id not in meta:
-        return jsonify({"erreur":"BD introuvable"}), 404
-
-    bd            = meta[bd_id]
-    # Support ancien format ("fichier") et nouveau ("pages")
-    nom_pages     = bd.get("pages") or bd.get("fichier","")
-    chemin_bd     = os.path.join(BIBLIO_FOLDER, nom_pages)
-    prenom_ancien = bd["prenom"]
-    type_couv     = bd.get("type_couv", "separee")
-
-    if not os.path.exists(chemin_bd):
-        return jsonify({"erreur": f"Fichier BD introuvable : {nom_pages}"}), 404
-
-    docs_a_assembler = []
-
-    # ── 1. Couverture séparée (PDF Canva personnalisé) ─────────────────────
-    if bd.get("couverture") and type_couv == "separee":
-        chemin_couv = os.path.join(BIBLIO_FOLDER, bd["couverture"])
-        if os.path.exists(chemin_couv):
-            try:
-                prenom_couv_ancien = bd.get("prenom_couv") or prenom_ancien
-                doc_couv, _ = personnaliser_pdf_pages(chemin_couv, prenom_couv_ancien, prenom_nouveau)
-                docs_a_assembler.append(doc_couv)
-            except Exception as e:
-                return jsonify({"erreur": f"Erreur couverture : {str(e)}"}), 500
-
-    # ── 2. Pages BD (couverture intégrée ou séparée) ───────────────────────
-    try:
-        doc_bd, nb = personnaliser_pdf_pages(chemin_bd, prenom_ancien, prenom_nouveau)
-        docs_a_assembler.append(doc_bd)
-    except Exception as e:
-        return jsonify({"erreur": f"Erreur BD : {str(e)}"}), 500
-
-    if nb == 0:
-        return jsonify({"erreur": f"'{prenom_ancien}' introuvable dans le PDF"}), 404
-
-    # ── 3. Assembler ───────────────────────────────────────────────────────
-    try:
-        chemin_final = assembler_pdf(docs_a_assembler, prenom_nouveau, compression)
-    except Exception as e:
-        return jsonify({"erreur": f"Erreur assemblage : {str(e)}"}), 500
-
-    taille_mo = round(os.path.getsize(chemin_final) / (1024*1024), 1)
-    nb_pages  = len(fitz.open(chemin_final))
-
-    return jsonify({
-        "succes":           True,
-        "fichier":          os.path.basename(chemin_final),
-        "taille_mo":        taille_mo,
-        "pages":            nb_pages,
-        "avec_couverture":  bool(bd.get("couverture"))
-    })
+    from flask import Response, stream_with_context
+    return Response(
+        stream_with_context(_stream_generer(bd_id, prenom_nouveau, compression)),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control":   "no-cache",
+            "X-Accel-Buffering": "no"
+        }
+    )
 
 @app.route("/telecharger/<nom>")
 def telecharger(nom):
