@@ -487,7 +487,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 .gen-msg{font-size:.82rem;font-weight:700;color:var(--doux);text-align:center;min-height:1.2em}
 
 /* Résultat */
-.resultat{display:none;text-align:center;padding:20px;border-radius:15px;background:linear-gradient(135deg,rgba(6,214,160,.07),rgba(108,60,225,.05));border:2px solid rgba(6,214,160,.22)}
+.resultat{display:none;text-align:center;padding:24px;border-radius:20px}
 .resultat.actif{display:block;animation:pop .35s ease}
 @keyframes pop{from{opacity:0;transform:scale(.95) translateY(8px)}to{opacity:1;transform:scale(1) translateY(0)}}
 .res-emoji{font-size:2.6rem;margin-bottom:5px}
@@ -565,17 +565,17 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
       <div class="gen-msg" id="gen-msg">Initialisation…</div>
     </div>
     <div class="msg err" id="err-perso"></div>
+  </div>
 
-    <!-- Résultat -->
-    <div class="resultat" id="resultat">
-      <div class="res-emoji">🎉</div>
-      <div class="res-titre" id="res-titre">PDF prêt !</div>
-      <div class="res-info" id="res-info"></div>
-      <div class="res-taille" id="res-taille"></div>
-      <br>
-      <a href="#" class="btn-dl" id="btn-dl" download>⬇️ Télécharger le PDF</a>
-      <button class="btn-nouveau" onclick="nouveau()">Personnaliser une autre BD</button>
-    </div>
+  <!-- Carte résultat (indépendante) -->
+  <div class="carte resultat" id="resultat">
+    <div class="res-emoji">🎉</div>
+    <div class="res-titre" id="res-titre">PDF prêt !</div>
+    <div class="res-info" id="res-info"></div>
+    <div class="res-taille" id="res-taille"></div>
+    <br>
+    <a href="#" class="btn-dl" id="btn-dl" download>⬇️ Télécharger le PDF</a>
+    <button class="btn-nouveau" onclick="nouveau()">Personnaliser une autre BD</button>
   </div>
 
   <!-- ═══ ONGLET BIBLIOTHÈQUE ═══ -->
@@ -907,6 +907,8 @@ async function generer() {
               document.getElementById('res-taille').textContent = '📦 ' + evt.taille_mo + ' Mo';
               document.getElementById('btn-dl').href = '/telecharger/' + evt.fichier;
               document.getElementById('btn-dl').download = 'BD_' + prenom_cap + '.pdf';
+              // Masquer le formulaire, afficher le résultat
+              document.getElementById('carte-perso').style.display = 'none';
               document.getElementById('resultat').classList.add('actif');
               document.getElementById('btn-gen').disabled = false;
               return;
@@ -931,8 +933,10 @@ async function generer() {
 
 function nouveau() {
   document.getElementById('resultat').classList.remove('actif');
+  document.getElementById('carte-perso').style.display = 'block';
   document.getElementById('prenom-nouveau').value = '';
   document.getElementById('ap-apres').textContent = '…';
+  majProgression(0, '');
 }
 
 function affMsg(el, txt, cls) {
