@@ -261,44 +261,69 @@ def personnaliser_pdf_pages(chemin_pdf, prenom_ancien, prenom_nouveau):
     total = 0
 
     for page in doc:
-        # Collecter les blocs à réécrire avec leur info de centrage
-        blocs_info = []
-        for bloc in page.get_text("dict")["blocks"]:
-            if bloc["type"] != 0:
-                continue
-            if not any(prenom_ancien.upper() in span["text"].upper()
-                       for line in bloc["lines"] for span in line["spans"]):
-                continue
-            centre, centre_x = est_bloc_centre(bloc, page.rect.width)
-            blocs_info.append({
-                "spans": [span for line in bloc["lines"] for span in line["spans"]],
-                "centre": centre,
-                "centre_x": centre_x
-            })
 
-        # ── Étape 1 : effacer ──────────────────────────────────────────────
-        for info in blocs_info:
+        # ── Collecter les LIGNES contenant le prénom ──────────────────────
+        lignes_a_reecrire = []
+        for bloc in page.get_text("dict")["blocks"]:
+            if bloc["type"] != 0: continue
+            for line in bloc["lines"]:
+                if not any(prenom_ancien.upper() in span["text"].upper()
+                           for span in line["spans"]):
+                    continue
+                centre, centre_x = est_bloc_centre(bloc, page.rect.width)
+                lignes_a_reecrire.append({
+                    "spans":    line["spans"],
+                    "centre":   centre,
+                    "centre_x": centre_x,
+                })
+
+        # ── Étape 1 : effacer tous les spans des lignes ciblées ───────────
+        for info in lignes_a_reecrire:
             for span in info["spans"]:
                 police_span = police_pour_span(span, cache_polices)
-                # Essayer de détecter la zone blanche réelle (cartouche Canva)
                 zone = zone_effacement(page, span, police_span, span["size"])
                 page.add_redact_annot(zone, fill=(1, 1, 1))
         page.apply_redactions()
 
-        # ── Étape 2 : réécrire avec centrage si nécessaire ─────────────────
-        for info in blocs_info:
-            for span in info["spans"]:
+        # ── Étape 2 : réécrire chaque ligne en recalculant les positions ──
+        for info in lignes_a_reecrire:
+            spans     = info["spans"]
+            prenom_up = prenom_ancien.upper()
+
+            # Calculer le delta_x : différence de largeur entre ancien et nouveau prénom
+            delta_x = 0.0
+            for span in spans:
+                if prenom_up in span["text"].upper():
+                    police  = police_pour_span(span, cache_polices)
+                    taille  = span["size"]
+                    texte_n = adapter_casse(prenom_nouveau, span["text"], prenom_ancien)
+                    w_ancien, _, _ = mesurer_texte(span["text"], police, taille)
+                    w_nouveau, _, _ = mesurer_texte(texte_n, police, taille)
+                    delta_x = w_nouveau - w_ancien
+                    break
+
+            # Réécrire chaque span
+            prenom_vu = False
+            for span in spans:
                 texte_nouveau = adapter_casse(prenom_nouveau, span["text"], prenom_ancien)
-                police = police_pour_span(span, cache_polices)
-                taille = span["size"]
-
+                police     = police_pour_span(span, cache_polices)
+                taille     = span["size"]
                 baseline_y = span["origin"][1]
-                w, asc, desc = mesurer_texte(texte_nouveau, police, taille)
+                contient   = prenom_up in span["text"].upper()
 
-                if info["centre"] and prenom_ancien.upper() in span["text"].upper():
-                    # ── Centré : recalculer X depuis le centre ────────────
-                    x_depart = info["centre_x"] - (w / 2)
+                if info["centre"] and contient:
+                    # Centré : recalculer X depuis le centre de la page
+                    w_n, _, _ = mesurer_texte(texte_nouveau, police, taille)
+                    x_depart = info["centre_x"] - w_n / 2
+                elif contient:
+                    # Span du prénom : position X originale
+                    x_depart = span["origin"][0]
+                    prenom_vu = True
+                elif prenom_vu and delta_x != 0.0:
+                    # Span APRÈS le prénom : décaler du delta
+                    x_depart = span["origin"][0] + delta_x
                 else:
+                    # Span AVANT le prénom : position inchangée
                     x_depart = span["origin"][0]
 
                 page.insert_text(
@@ -312,25 +337,61 @@ def personnaliser_pdf_pages(chemin_pdf, prenom_ancien, prenom_nouveau):
 
     return doc, total
 
+
 # ── Assemblage PDF final ───────────────────────────────────────────────────
+def recompresser_images_pdf(doc, qualite_jpeg: int):
+    """
+    Recompresse toutes les images PNG du PDF en JPEG avec la qualité donnée.
+    C'est la vraie compression — PyMuPDF seul ne réduit pas les images PNG.
+    """
+    from PIL import Image as PILImage
+    import io as _io
+
+    for page in doc:
+        for img_info in page.get_images(full=True):
+            xref = img_info[0]
+            try:
+                base = doc.extract_image(xref)
+                img_bytes = base["image"]
+                ext = base.get("ext", "").lower()
+
+                # Recompresser PNG et images volumineuses en JPEG
+                if ext in ("png", "jpg", "jpeg") and len(img_bytes) > 50_000:
+                    pil_img = PILImage.open(_io.BytesIO(img_bytes)).convert("RGB")
+                    buffer = _io.BytesIO()
+                    pil_img.save(buffer, format="JPEG",
+                                 quality=qualite_jpeg, optimize=True)
+                    doc.update_stream(xref, buffer.getvalue())
+            except Exception:
+                pass  # Ignorer les images non modifiables
+    return doc
+
+
 def assembler_pdf(docs, prenom, compression):
     """
     Assemble une liste de fitz.Document en un seul PDF final.
     docs = [doc_couverture, doc_bd] ou [doc_bd] si pas de couverture.
+
+    Niveaux de compression :
+    - aucune  : assemblage simple sans retraitement
+    - moyenne : recompression JPEG q=85 + optimisation flux
+    - forte   : recompression JPEG q=55 + optimisation flux maximale
     """
     pdf_final = fitz.open()
     for doc in docs:
         pdf_final.insert_pdf(doc)
 
-    nom = f"BD_{prenom.capitalize()}_{uuid.uuid4().hex[:6]}.pdf"
+    nom    = f"BD_{prenom.capitalize()}_{uuid.uuid4().hex[:6]}.pdf"
     chemin = os.path.join(OUTPUT_FOLDER, nom)
 
     if compression == "forte":
-        pdf_final.save(chemin, garbage=4, deflate=True, clean=True,
-                       deflate_images=True, deflate_fonts=True)
+        pdf_final = recompresser_images_pdf(pdf_final, qualite_jpeg=55)
+        pdf_final.save(chemin, garbage=4, deflate=True, clean=True)
     elif compression == "moyenne":
+        pdf_final = recompresser_images_pdf(pdf_final, qualite_jpeg=85)
         pdf_final.save(chemin, garbage=3, deflate=True, clean=True)
     else:
+        # Aucune compression — fichier original intact
         pdf_final.save(chemin)
 
     return chemin
@@ -1043,6 +1104,308 @@ def telecharger(nom):
     chemin = os.path.join(OUTPUT_FOLDER, nom)
     if not os.path.exists(chemin): return "Fichier introuvable", 404
     return send_file(chemin, as_attachment=True, download_name=nom)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WEBHOOK CHARIOW — Réception paiement + génération PDF automatique
+# ══════════════════════════════════════════════════════════════════════════════
+
+import threading
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
+
+# Variables d'environnement pour l'envoi email
+SMTP_HOST     = os.environ.get("SMTP_HOST", "")
+SMTP_PORT     = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER     = os.environ.get("SMTP_USER", "")
+SMTP_PASSWORD = os.environ.get("SMTP_PASS", "")
+EMAIL_FROM    = os.environ.get("EMAIL_FROM", "")
+APP_URL       = os.environ.get("APP_URL", "https://bd-personnalisee.onrender.com")
+CHARIOW_SECRET = os.environ.get("CHARIOW_WEBHOOK_SECRET", "")
+
+# ── Clé de déduplication (évite les doublons en cas de retry Chariow) ────────
+_processed_sales = set()
+
+
+def envoyer_email_pdf(destinataire: str, prenom: str, chemin_pdf: str, nom_bd: str):
+    """Envoie le PDF personnalisé par email au client."""
+    if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_FROM]):
+        print(f"⚠️ SMTP non configuré — email non envoyé à {destinataire}")
+        return False
+    try:
+        msg = MIMEMultipart()
+        msg["From"]    = EMAIL_FROM
+        msg["To"]      = destinataire
+        msg["Subject"] = f"📚 Ta BD personnalisée est prête, {prenom} !"
+
+        corps = f"""Bonjour,
+
+Ta BD personnalisée "{nom_bd}" avec le prénom {prenom} est prête !
+
+Tu peux télécharger ton PDF en pièce jointe de cet email.
+
+Bonne lecture ! 🎉
+
+— EnfantProdige
+"""
+        msg.attach(MIMEText(corps, "plain", "utf-8"))
+
+        # Attacher le PDF
+        with open(chemin_pdf, "rb") as f:
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(f.read())
+        encoders.encode_base64(part)
+        nom_fichier = f"BD_{prenom}.pdf"
+        part.add_header("Content-Disposition", f"attachment; filename={nom_fichier}")
+        msg.attach(part)
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(EMAIL_FROM, destinataire, msg.as_string())
+
+        print(f"✅ Email envoyé à {destinataire}")
+        return True
+    except Exception as e:
+        print(f"❌ Erreur email : {e}")
+        return False
+
+
+def traiter_commande(sale_id: str, prenom: str, email_client: str,
+                     bd_id: str, compression: str = "moyenne"):
+    """
+    Traitement asynchrone : personnalise la BD et envoie l'email.
+    Appelé dans un thread séparé pour répondre 200 à Chariow immédiatement.
+    """
+    print(f"🔄 Traitement commande {sale_id} — prénom: {prenom} — BD: {bd_id}")
+
+    meta = lire_meta()
+    if bd_id not in meta:
+        print(f"❌ BD introuvable : {bd_id}")
+        return
+
+    bd = meta[bd_id]
+    nom_bd        = bd["nom"]
+    nom_pages     = bd.get("pages") or bd.get("fichier", "")
+    chemin_bd     = os.path.join(BIBLIO_FOLDER, nom_pages)
+    prenom_ancien = bd["prenom"]
+    type_couv     = bd.get("type_couv", "separee")
+
+    if not os.path.exists(chemin_bd):
+        print(f"❌ Fichier BD introuvable : {chemin_bd}")
+        return
+
+    docs = []
+
+    # Couverture
+    if bd.get("couverture") and type_couv == "separee":
+        chemin_couv = os.path.join(BIBLIO_FOLDER, bd["couverture"])
+        if os.path.exists(chemin_couv):
+            try:
+                prenom_couv_ancien = bd.get("prenom_couv") or prenom_ancien
+                doc_couv, _ = personnaliser_pdf_pages(chemin_couv, prenom_couv_ancien, prenom)
+                docs.append(doc_couv)
+            except Exception as e:
+                print(f"❌ Erreur couverture : {e}")
+
+    # Pages BD
+    try:
+        doc_bd, nb = personnaliser_pdf_pages(chemin_bd, prenom_ancien, prenom)
+        docs.append(doc_bd)
+        print(f"✅ {nb} remplacement(s) effectué(s)")
+    except Exception as e:
+        print(f"❌ Erreur BD : {e}")
+        return
+
+    if not docs:
+        print("❌ Aucun document à assembler")
+        return
+
+    # Assemblage
+    try:
+        chemin_final = assembler_pdf(docs, prenom, compression)
+        print(f"✅ PDF généré : {chemin_final}")
+    except Exception as e:
+        print(f"❌ Erreur assemblage : {e}")
+        return
+
+    # Envoi email
+    envoyer_email_pdf(email_client, prenom, chemin_final, nom_bd)
+
+
+@app.route("/api/webhook/chariow", methods=["POST"])
+def webhook_chariow():
+    """
+    Reçoit le webhook Chariow (successful.sale) et déclenche la génération PDF.
+
+    Champs attendus dans custom_fields ou custom_metadata :
+      - prenom_enfant : prénom à personnaliser (obligatoire)
+      - bd_id         : identifiant de la BD dans la bibliothèque (obligatoire)
+      - compression   : aucune | moyenne | forte (optionnel, défaut: moyenne)
+    """
+    # ── 1. Répondre 200 immédiatement (Chariow attend < 30s) ─────────────────
+    data = request.get_json(silent=True) or {}
+
+    # ── 2. Vérifier que c'est bien une vente réussie ─────────────────────────
+    event = data.get("event", "")
+    if event != "successful.sale":
+        return jsonify({"status": "ignored", "event": event}), 200
+
+    sale    = data.get("sale", {})
+    sale_id = sale.get("id", "")
+    customer = data.get("customer", {})
+    email_client = customer.get("email", "")
+
+    # ── 3. Déduplication (retry Chariow) ──────────────────────────────────────
+    if sale_id in _processed_sales:
+        return jsonify({"status": "duplicate", "sale_id": sale_id}), 200
+    _processed_sales.add(sale_id)
+
+    # ── 4. Récupérer le prénom et le bd_id ────────────────────────────────────
+    # Chercher dans custom_fields ET custom_metadata
+    custom_fields   = sale.get("custom_fields")   or {}
+    custom_metadata = sale.get("custom_metadata") or {}
+    all_custom = {**custom_metadata, **custom_fields}
+
+    prenom      = all_custom.get("prenom_enfant", "").strip()
+    bd_id       = all_custom.get("bd_id", "").strip()
+    compression = all_custom.get("compression", "moyenne").strip()
+
+    if not prenom:
+        return jsonify({"status": "erreur", "message": "prenom_enfant manquant"}), 400
+    if not bd_id:
+        return jsonify({"status": "erreur", "message": "bd_id manquant"}), 400
+
+    # ── 5. Lancer le traitement en arrière-plan ───────────────────────────────
+    thread = threading.Thread(
+        target=traiter_commande,
+        args=(sale_id, prenom, email_client, bd_id, compression),
+        daemon=True
+    )
+    thread.start()
+
+    return jsonify({
+        "status": "accepted",
+        "sale_id": sale_id,
+        "prenom": prenom,
+        "bd_id": bd_id
+    }), 200
+
+
+@app.route("/api/generer-bd", methods=["POST"])
+def api_generer_bd():
+    """
+    Route API directe pour générer une BD personnalisée.
+    Utile pour les intégrations custom (site web, app mobile, etc.)
+
+    Body JSON attendu :
+    {
+        "bd_id": "identifiant_bd",
+        "prenom": "AMINATA",
+        "email": "parent@email.com",    (optionnel — pour envoi email)
+        "compression": "moyenne"         (optionnel)
+    }
+
+    Retourne : { succes, fichier, taille_mo, pages, lien_telechargement }
+    """
+    data = request.get_json(silent=True) or {}
+
+    bd_id       = data.get("bd_id", "").strip()
+    prenom      = data.get("prenom", "").strip()
+    email       = data.get("email", "").strip()
+    compression = data.get("compression", "moyenne").strip()
+
+    if not bd_id:
+        return jsonify({"erreur": "bd_id manquant"}), 400
+    if not prenom:
+        return jsonify({"erreur": "prenom manquant"}), 400
+
+    meta = lire_meta()
+    if bd_id not in meta:
+        return jsonify({"erreur": f"BD introuvable : {bd_id}"}), 404
+
+    bd            = meta[bd_id]
+    nom_pages     = bd.get("pages") or bd.get("fichier", "")
+    chemin_bd     = os.path.join(BIBLIO_FOLDER, nom_pages)
+    prenom_ancien = bd["prenom"]
+    type_couv     = bd.get("type_couv", "separee")
+
+    if not os.path.exists(chemin_bd):
+        return jsonify({"erreur": "Fichier BD introuvable sur le serveur"}), 404
+
+    docs = []
+
+    # Couverture
+    if bd.get("couverture") and type_couv == "separee":
+        chemin_couv = os.path.join(BIBLIO_FOLDER, bd["couverture"])
+        if os.path.exists(chemin_couv):
+            try:
+                prenom_couv_ancien = bd.get("prenom_couv") or prenom_ancien
+                doc_couv, _ = personnaliser_pdf_pages(chemin_couv, prenom_couv_ancien, prenom)
+                docs.append(doc_couv)
+            except Exception as e:
+                return jsonify({"erreur": f"Erreur couverture : {str(e)}"}), 500
+
+    # Pages BD
+    try:
+        doc_bd, nb = personnaliser_pdf_pages(chemin_bd, prenom_ancien, prenom)
+        docs.append(doc_bd)
+    except Exception as e:
+        return jsonify({"erreur": f"Erreur BD : {str(e)}"}), 500
+
+    if nb == 0:
+        return jsonify({"erreur": f"'{prenom_ancien}' introuvable dans le PDF"}), 404
+
+    # Assemblage
+    try:
+        chemin_final = assembler_pdf(docs, prenom, compression)
+    except Exception as e:
+        return jsonify({"erreur": f"Erreur assemblage : {str(e)}"}), 500
+
+    nom_fichier = os.path.basename(chemin_final)
+    taille_mo   = round(os.path.getsize(chemin_final) / (1024*1024), 1)
+    nb_pages    = len(fitz.open(chemin_final))
+    lien        = f"{APP_URL}/telecharger/{nom_fichier}"
+
+    # Envoi email si fourni
+    if email:
+        threading.Thread(
+            target=envoyer_email_pdf,
+            args=(email, prenom, chemin_final, bd["nom"]),
+            daemon=True
+        ).start()
+
+    return jsonify({
+        "succes":               True,
+        "fichier":              nom_fichier,
+        "taille_mo":            taille_mo,
+        "pages":                nb_pages,
+        "lien_telechargement":  lien,
+        "avec_couverture":      bool(bd.get("couverture"))
+    }), 200
+
+
+@app.route("/api/bds", methods=["GET"])
+def api_liste_bds():
+    """
+    Liste toutes les BDs disponibles dans la bibliothèque.
+    Utile pour construire un sélecteur côté site web.
+    """
+    meta = lire_meta()
+    bds  = [
+        {
+            "id":          bd["id"],
+            "nom":         bd["nom"],
+            "prenom":      bd["prenom"],
+            "couverture":  bool(bd.get("couverture")),
+            "type_couv":   bd.get("type_couv", "separee")
+        }
+        for bd in meta.values()
+    ]
+    return jsonify({"bds": bds}), 200
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
