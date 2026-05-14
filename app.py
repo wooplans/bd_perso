@@ -1,10 +1,59 @@
 from flask import Flask, request, jsonify, send_file
 import fitz
-import re, os, uuid, json, glob
+import re, os, uuid, json, glob, tempfile
+import urllib.request
 
 app = Flask(__name__)
 
 BIBLIO_FOLDER = "./bibliotheque"
+
+def telecharger_drive(url: str, suffixe: str = ".pdf") -> str:
+    """
+    Télécharge un PDF depuis un lien Google Drive public.
+    Supporte les formats :
+      - https://drive.google.com/file/d/{ID}/view
+      - https://drive.google.com/open?id={ID}
+      - https://docs.google.com/...
+    Retourne le chemin local du fichier téléchargé.
+    """
+    import re as _re, urllib.request as _req, urllib.error
+
+    # Extraire l'ID du fichier Drive
+    patterns = [
+        r"/file/d/([a-zA-Z0-9_-]+)",
+        r"[?&]id=([a-zA-Z0-9_-]+)",
+        r"/d/([a-zA-Z0-9_-]+)",
+    ]
+    file_id = None
+    for pat in patterns:
+        m = _re.search(pat, url)
+        if m:
+            file_id = m.group(1)
+            break
+
+    if not file_id:
+        raise ValueError(f"Impossible d'extraire l'ID Google Drive depuis : {url}")
+
+    # URL de téléchargement direct
+    download_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
+
+    chemin = os.path.join(BIBLIO_FOLDER, f"drive_{uuid.uuid4().hex[:10]}{suffixe}")
+    os.makedirs(BIBLIO_FOLDER, exist_ok=True)
+
+    headers = {"User-Agent": "Mozilla/5.0"}
+    req = urllib.request.Request(download_url, headers=headers)
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        with open(chemin, "wb") as f:
+            f.write(resp.read())
+
+    # Vérifier que c'est bien un PDF
+    with open(chemin, "rb") as f:
+        header = f.read(4)
+    if header != b"%PDF":
+        os.remove(chemin)
+        raise ValueError("Le fichier téléchargé n'est pas un PDF valide. Vérifiez que le lien est public.")
+
+    return chemin
 OUTPUT_FOLDER = "./output"
 META_FILE     = "./bibliotheque/meta.json"
 
@@ -581,14 +630,33 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
   <!-- ═══ ONGLET BIBLIOTHÈQUE ═══ -->
   <div class="carte" style="display:none" id="carte-biblio">
 
-    <!-- Pages BD -->
-    <label class="label">Pages BD (PDF Canva)</label>
-    <div class="zone-upload" id="zone-up">
-      <input type="file" id="input-pdf" accept=".pdf">
-      <span class="icone">📄</span>
-      <div class="lbl">Glisse le PDF des pages ici</div>
-      <div class="sub">Export PDF depuis Canva</div>
-      <div class="nom-fichier" id="nom-fich"></div>
+    <!-- Toggle source : Upload ou Google Drive -->
+    <div class="comp-row" style="margin-bottom:16px">
+      <button class="comp-btn actif" id="btn-src-upload" onclick="setSource('upload',this)">📁 Upload fichier</button>
+      <button class="comp-btn" id="btn-src-drive" onclick="setSource('drive',this)">🔗 Lien Google Drive</button>
+    </div>
+
+    <!-- === PAGES BD === -->
+    <label class="label">Pages BD</label>
+
+    <!-- Upload -->
+    <div id="src-upload-bd">
+      <div class="zone-upload" id="zone-up">
+        <input type="file" id="input-pdf" accept=".pdf">
+        <span class="icone">📄</span>
+        <div class="lbl">Glisse le PDF des pages ici</div>
+        <div class="sub">Export PDF depuis Canva</div>
+        <div class="nom-fichier" id="nom-fich"></div>
+      </div>
+    </div>
+
+    <!-- Drive -->
+    <div id="src-drive-bd" style="display:none">
+      <input type="text" class="champ-nom" id="lien-drive-bd"
+        placeholder="https://drive.google.com/file/d/…/view">
+      <div style="font-size:.72rem;color:var(--doux);margin-bottom:12px">
+        💡 Partage le fichier Drive en "Tout le monde peut voir"
+      </div>
     </div>
 
     <label class="label">Nom de la BD</label>
@@ -599,32 +667,47 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 
     <div class="sep"></div>
 
-    <!-- Couverture PDF -->
-    <label class="label">Couverture (PDF Canva — optionnel)</label>
-    <div class="zone-upload" id="zone-couv-biblio">
-      <input type="file" id="input-couv-biblio" accept=".pdf">
-      <span class="icone">🎨</span>
-      <div class="lbl">Glisse la couverture ici</div>
-      <div class="sub">PDF Canva avec le prénom</div>
-      <div class="nom-fichier" id="nom-couv-fich"></div>
+    <!-- === COUVERTURE === -->
+    <label class="label">Couverture (optionnel)</label>
+
+    <!-- Type couverture -->
+    <div class="comp-row" style="margin-bottom:12px">
+      <button class="comp-btn actif" id="btn-couv-sep" onclick="setTypeCouv('separee',this)">📄 Séparée</button>
+      <button class="comp-btn" id="btn-couv-int" onclick="setTypeCouv('integree',this)">📋 Intégrée</button>
+      <button class="comp-btn" id="btn-couv-bd" onclick="setTypeCouv('avec_bd',this)">📦 Couv + BD ensemble</button>
+    </div>
+    <div id="hint-type-couv" style="font-size:.72rem;color:var(--doux);margin-bottom:12px">
+      La couverture est un PDF Canva séparé des pages BD
     </div>
 
-    <label class="label">Prénom placeholder sur la couverture</label>
-    <input type="text" class="champ-nom" id="prenom-couv-bd" placeholder="Ex : WILLIAM (laisser vide = même que pages)">
+    <!-- Zone couverture (cachée si intégrée ou avec_bd) -->
+    <div id="zone-couv-wrapper">
+      <!-- Upload couverture -->
+      <div id="src-upload-couv">
+        <div class="zone-upload" id="zone-couv-biblio">
+          <input type="file" id="input-couv-biblio" accept=".pdf">
+          <span class="icone">🎨</span>
+          <div class="lbl">Glisse la couverture ici</div>
+          <div class="sub">PDF Canva avec le prénom</div>
+          <div class="nom-fichier" id="nom-couv-fich"></div>
+        </div>
+      </div>
 
-    <label class="label">Type de couverture</label>
-    <div class="comp-row" style="margin-bottom:16px">
-      <button class="comp-btn actif" id="btn-couv-sep" onclick="setTypeCouv('separee',this)">📄 Fichier séparé</button>
-      <button class="comp-btn" id="btn-couv-int" onclick="setTypeCouv('integree',this)">📋 Intégrée au doc</button>
-    </div>
-    <div id="hint-type-couv" style="font-size:.72rem;color:var(--doux);margin-top:-12px;margin-bottom:14px">
-      La couverture est un PDF Canva séparé des pages
+      <!-- Drive couverture -->
+      <div id="src-drive-couv" style="display:none">
+        <input type="text" class="champ-nom" id="lien-drive-couv"
+          placeholder="https://drive.google.com/file/d/…/view">
+      </div>
+
+      <label class="label">Prénom placeholder sur la couverture</label>
+      <input type="text" class="champ-nom" id="prenom-couv-bd"
+        placeholder="Ex : WILLIAM (laisser vide = même que pages)">
     </div>
 
     <button class="btn-sm" id="btn-upload-bd" onclick="uploadBD()">➕ Ajouter à la bibliothèque</button>
     <div class="progress-wrap" id="progress-wrap" style="display:none;margin-top:12px">
       <div class="progress-bar" id="progress-bar"></div>
-      <div class="progress-label" id="progress-label">Upload en cours…</div>
+      <div class="progress-label" id="progress-label">Chargement en cours…</div>
     </div>
     <div class="msg" id="msg-upload"></div>
 
@@ -698,19 +781,34 @@ zoneUp.addEventListener('drop', e => {
   }
 });
 
-let typeCouv = 'separee';
+let typeCouv  = 'separee';
+let srcMode   = 'upload';  // 'upload' ou 'drive'
+
+function setSource(val, btn) {
+  srcMode = val;
+  document.querySelectorAll('#btn-src-upload, #btn-src-drive').forEach(b => b.classList.remove('actif'));
+  btn.classList.add('actif');
+  // Pages BD
+  document.getElementById('src-upload-bd').style.display   = val === 'upload' ? 'block' : 'none';
+  document.getElementById('src-drive-bd').style.display    = val === 'drive'  ? 'block' : 'none';
+  // Couverture
+  document.getElementById('src-upload-couv').style.display = val === 'upload' ? 'block' : 'none';
+  document.getElementById('src-drive-couv').style.display  = val === 'drive'  ? 'block' : 'none';
+}
 
 function setTypeCouv(val, btn) {
   typeCouv = val;
-  document.querySelectorAll('#btn-couv-sep, #btn-couv-int').forEach(b => b.classList.remove('actif'));
+  document.querySelectorAll('#btn-couv-sep, #btn-couv-int, #btn-couv-bd').forEach(b => b.classList.remove('actif'));
   btn.classList.add('actif');
-  document.getElementById('hint-type-couv').textContent =
-    val === 'separee'
-      ? 'La couverture est un PDF Canva séparé des pages'
-      : 'La couverture est déjà incluse comme première page du document';
-  // Masquer la zone upload couverture si intégrée
-  document.getElementById('zone-couv-biblio').style.opacity = val === 'integree' ? '.4' : '1';
-  document.getElementById('zone-couv-biblio').style.pointerEvents = val === 'integree' ? 'none' : 'auto';
+  const hints = {
+    separee:  'La couverture est un PDF Canva séparé des pages BD',
+    integree: 'La couverture est déjà incluse comme 1ère page du document BD',
+    avec_bd:  'Upload un seul PDF contenant couverture + pages BD ensemble'
+  };
+  document.getElementById('hint-type-couv').textContent = hints[val];
+  // Masquer la zone couverture si intégrée ou avec_bd
+  const cachee = val === 'integree' || val === 'avec_bd';
+  document.getElementById('zone-couv-wrapper').style.display = cachee ? 'none' : 'block';
 }
 
 function setProgress(pct, label) {
@@ -719,34 +817,44 @@ function setProgress(pct, label) {
 }
 
 async function uploadBD() {
-  const f      = inputPdf.files[0];
-  const fCouv  = document.getElementById('input-couv-biblio').files[0];
-  const nom    = document.getElementById('nom-bd').value.trim();
-  const prenom = document.getElementById('prenom-bd').value.trim();
+  const nom        = document.getElementById('nom-bd').value.trim();
+  const prenom     = document.getElementById('prenom-bd').value.trim();
   const prenomCouv = document.getElementById('prenom-couv-bd').value.trim();
-  const msgEl  = document.getElementById('msg-upload');
-  const btn    = document.getElementById('btn-upload-bd');
-  msgEl.className = 'msg';
+  const msgEl      = document.getElementById('msg-upload');
+  const btn        = document.getElementById('btn-upload-bd');
+  msgEl.className  = 'msg';
 
-  if (!f)     { affMsg(msgEl,'Choisis le PDF des pages.','err'); return; }
+  // Récupérer les sources selon le mode
+  const f        = inputPdf.files[0];
+  const fCouv    = document.getElementById('input-couv-biblio').files[0];
+  const lienBd   = document.getElementById('lien-drive-bd').value.trim();
+  const lienCouv = document.getElementById('lien-drive-couv').value.trim();
+
+  if (srcMode === 'upload' && !f)    { affMsg(msgEl,'Choisis le PDF des pages.','err'); return; }
+  if (srcMode === 'drive'  && !lienBd){ affMsg(msgEl,'Colle un lien Google Drive pour les pages.','err'); return; }
   if (!nom)   { affMsg(msgEl,'Donne un nom à cette BD.','err'); return; }
   if (!prenom){ affMsg(msgEl,'Indique le prénom placeholder.','err'); return; }
 
-  // UI → chargement
   btn.disabled = true;
-  btn.textContent = '⏳ Upload en cours…';
+  btn.textContent = '⏳ Chargement en cours…';
   document.getElementById('progress-wrap').style.display = 'block';
-  setProgress(10, 'Préparation…');
+  setProgress(10, srcMode === 'drive' ? 'Téléchargement depuis Drive…' : 'Préparation…');
 
   const fd = new FormData();
-  fd.append('pdf', f);
   fd.append('nom', nom);
   fd.append('prenom', prenom);
   fd.append('prenom_couv', prenomCouv || prenom);
   fd.append('type_couv', typeCouv);
-  if (fCouv && typeCouv === 'separee') fd.append('couverture', fCouv);
 
-  setProgress(30, 'Envoi du fichier…');
+  if (srcMode === 'upload') {
+    fd.append('pdf', f);
+    if (fCouv && typeCouv === 'separee') fd.append('couverture', fCouv);
+  } else {
+    fd.append('lien_drive_bd', lienBd);
+    if (lienCouv && typeCouv === 'separee') fd.append('lien_drive_couv', lienCouv);
+  }
+
+  setProgress(30, 'Envoi en cours…');
 
   try {
     const res  = await fetch('/ajouter-bd', { method:'POST', body:fd });
@@ -767,11 +875,13 @@ async function uploadBD() {
     }, 600);
 
     // Reset
-    inputPdf.value = '';
+    if (inputPdf) inputPdf.value = '';
     document.getElementById('input-couv-biblio').value = '';
-    zoneUp.classList.remove('ok');
+    document.getElementById('lien-drive-bd').value = '';
+    document.getElementById('lien-drive-couv').value = '';
+    if (zoneUp) zoneUp.classList.remove('ok');
     document.getElementById('zone-couv-biblio').classList.remove('ok');
-    nomFich.style.display = 'none';
+    if (nomFich) nomFich.style.display = 'none';
     document.getElementById('nom-couv-fich').style.display = 'none';
     document.getElementById('nom-bd').value = '';
     document.getElementById('prenom-bd').value = '';
@@ -961,24 +1071,44 @@ def index():
 def ajouter_bd():
     fichier      = request.files.get("pdf")
     couv_fichier = request.files.get("couverture")
+    lien_bd      = request.form.get("lien_drive_bd","").strip()
+    lien_couv    = request.form.get("lien_drive_couv","").strip()
     nom          = request.form.get("nom","").strip()
     prenom_bd    = request.form.get("prenom","").strip().upper()
     prenom_couv  = request.form.get("prenom_couv","").strip().upper()
 
-    if not fichier or not nom or not prenom_bd:
-        return jsonify({"erreur":"Données manquantes"}), 400
+    if not nom or not prenom_bd:
+        return jsonify({"erreur":"Nom et prénom obligatoires"}), 400
+    if not fichier and not lien_bd:
+        return jsonify({"erreur":"Fournis un fichier PDF ou un lien Google Drive pour les pages BD"}), 400
 
     bd_id = uuid.uuid4().hex[:10]
 
-    # Sauvegarder les pages BD
+    # ── Pages BD ──────────────────────────────────────────────────────────
     chemin_bd = os.path.join(BIBLIO_FOLDER, f"{bd_id}_bd.pdf")
-    fichier.save(chemin_bd)
+    if fichier:
+        fichier.save(chemin_bd)
+    elif lien_bd:
+        try:
+            chemin_tmp = telecharger_drive(lien_bd)
+            os.rename(chemin_tmp, chemin_bd)
+        except Exception as e:
+            return jsonify({"erreur": f"Erreur téléchargement BD : {str(e)}"}), 400
 
-    # Sauvegarder la couverture si fournie
-    chemin_couv = None
+    # ── Couverture ────────────────────────────────────────────────────────
+    chemin_couv_nom = None
     if couv_fichier:
         chemin_couv = os.path.join(BIBLIO_FOLDER, f"{bd_id}_couv.pdf")
         couv_fichier.save(chemin_couv)
+        chemin_couv_nom = f"{bd_id}_couv.pdf"
+    elif lien_couv:
+        try:
+            chemin_tmp = telecharger_drive(lien_couv)
+            chemin_couv = os.path.join(BIBLIO_FOLDER, f"{bd_id}_couv.pdf")
+            os.rename(chemin_tmp, chemin_couv)
+            chemin_couv_nom = f"{bd_id}_couv.pdf"
+        except Exception as e:
+            return jsonify({"erreur": f"Erreur téléchargement couverture : {str(e)}"}), 400
 
     meta = lire_meta()
     meta[bd_id] = {
@@ -987,15 +1117,29 @@ def ajouter_bd():
         "prenom":      prenom_bd,
         "prenom_couv": prenom_couv or prenom_bd,
         "pages":       f"{bd_id}_bd.pdf",
-        "couverture":  f"{bd_id}_couv.pdf" if chemin_couv else None,
-        "type_couv":   request.form.get("type_couv", "separee")
+        "couverture":  chemin_couv_nom,
+        "type_couv":   request.form.get("type_couv", "separee"),
+        "source_bd":   lien_bd or "upload",
+        "source_couv": lien_couv or ("upload" if couv_fichier else None)
     }
     ecrire_meta(meta)
     return jsonify({"succes":True,"id":bd_id})
 
 @app.route("/liste-bds")
 def liste_bds():
-    return jsonify({"bds": list(lire_meta().values())})
+    meta = lire_meta()
+    bds  = []
+    for bd in meta.values():
+        bds.append({
+            "id":          bd["id"],
+            "nom":         bd["nom"],
+            "prenom":      bd["prenom"],
+            "prenom_couv": bd.get("prenom_couv",""),
+            "couverture":  bool(bd.get("couverture")),
+            "type_couv":   bd.get("type_couv","separee"),
+            "source_bd":   bd.get("source_bd","upload"),
+        })
+    return jsonify({"bds": bds})
 
 @app.route("/supprimer-bd/<bd_id>", methods=["DELETE"])
 def supprimer_bd(bd_id):
@@ -1034,7 +1178,9 @@ def _stream_generer(bd_id, prenom_nouveau, compression):
     docs_a_assembler = []
 
     # ── Étape 1 : Couverture ───────────────────────────────────────────────
-    if bd.get("couverture") and type_couv == "separee":
+    if type_couv == "avec_bd":
+        yield evt(10, "📦 Couverture intégrée dans le document BD…")
+    elif bd.get("couverture") and type_couv == "separee":
         chemin_couv = os.path.join(BIBLIO_FOLDER, bd["couverture"])
         if os.path.exists(chemin_couv):
             yield evt(10, "🎨 Personnalisation de la couverture…")
