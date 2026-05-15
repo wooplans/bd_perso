@@ -384,10 +384,50 @@ def personnaliser_pdf_pages(chemin_pdf, prenom_ancien, prenom_nouveau):
 
 
 # ── Assemblage PDF final ───────────────────────────────────────────────────
+def compresser_images_pdf(doc, qualite_jpeg: int, max_dim: int = 0):
+    """
+    Recompresse toutes les images PNG/JPEG d'un PDF en JPEG optimisé.
+    - qualite_jpeg : qualité JPEG (1-100)
+    - max_dim      : redimensionner si une dimension dépasse cette valeur (0 = pas de resize)
+    """
+    from PIL import Image as PILImage
+    import io as _io
+
+    for page_num in range(len(doc)):
+        for img_info in doc.get_page_images(page_num, full=True):
+            xref = img_info[0]
+            try:
+                base = doc.extract_image(xref)
+                data = base["image"]
+                if len(data) < 3000:
+                    continue  # ignorer les petites images (icônes, etc.)
+
+                img = PILImage.open(_io.BytesIO(data)).convert("RGB")
+                w, h = img.size
+
+                # Redimensionner si demandé
+                if max_dim > 0 and max(w, h) > max_dim:
+                    ratio = max_dim / max(w, h)
+                    img = img.resize((int(w * ratio), int(h * ratio)), PILImage.LANCZOS)
+
+                buf = _io.BytesIO()
+                img.save(buf, format="JPEG", quality=qualite_jpeg, optimize=True)
+                new_data = buf.getvalue()
+
+                # Ne remplacer que si ça réduit vraiment
+                if len(new_data) < len(data):
+                    doc.update_stream(xref, new_data)
+
+            except Exception:
+                pass
+
+    return doc
+
+
 def aplatir_pdf(doc, dpi: int, qualite_jpeg: int) -> fitz.Document:
     """
-    Aplatit un PDF : rasterise chaque page en JPEG puis reconstruit un PDF propre.
-    Élimine tous les calques, métadonnées et redondances — réduction max de la taille.
+    Aplatit un PDF : rasterise chaque page en JPEG puis reconstruit un PDF.
+    Élimine tous les calques et redondances — réduction maximale.
     """
     from PIL import Image as PILImage
     import io as _io
@@ -396,28 +436,24 @@ def aplatir_pdf(doc, dpi: int, qualite_jpeg: int) -> fitz.Document:
     doc_flat = fitz.open()
 
     for page in doc:
-        # Rasteriser la page entière
         pix  = page.get_pixmap(matrix=mat, alpha=False)
         img  = PILImage.frombytes("RGB", [pix.width, pix.height], pix.samples)
         buf  = _io.BytesIO()
         img.save(buf, format="JPEG", quality=qualite_jpeg, optimize=True)
-        jpeg_bytes = buf.getvalue()
-
-        # Créer une nouvelle page avec les dimensions originales (en points PDF)
         page_new = doc_flat.new_page(width=page.rect.width, height=page.rect.height)
-        page_new.insert_image(page_new.rect, stream=jpeg_bytes)
+        page_new.insert_image(page_new.rect, stream=buf.getvalue())
 
     return doc_flat
 
 
 def assembler_pdf(docs, prenom, compression):
     """
-    Assemble puis aplatit le PDF final.
+    Assemble et compresse le PDF final.
 
     Niveaux :
     - aucune  : assemblage simple, aucun retraitement
-    - moyenne : aplatissement 150dpi JPEG q=85  → ~-80%
-    - forte   : aplatissement 120dpi JPEG q=72  → ~-85%
+    - moyenne : recompression JPEG q=70 + resize max 1200px → ~-75%
+    - forte   : aplatissement complet 150dpi JPEG q=80 → ~-85%
     """
     pdf_final = fitz.open()
     for doc in docs:
@@ -427,13 +463,16 @@ def assembler_pdf(docs, prenom, compression):
     chemin = os.path.join(OUTPUT_FOLDER, nom)
 
     if compression == "forte":
-        pdf_final = aplatir_pdf(pdf_final, dpi=120, qualite_jpeg=72)
+        # Aplatissement complet : rasterise tout → JPEG
+        pdf_final = aplatir_pdf(pdf_final, dpi=150, qualite_jpeg=80)
         pdf_final.save(chemin, garbage=4, deflate=True)
     elif compression == "moyenne":
-        pdf_final = aplatir_pdf(pdf_final, dpi=150, qualite_jpeg=85)
-        pdf_final.save(chemin, garbage=3, deflate=True)
+        # Recompression intelligente : garde le texte vectoriel
+        pdf_final = compresser_images_pdf(pdf_final, qualite_jpeg=70, max_dim=1200)
+        pdf_final.save(chemin, garbage=4, deflate=True, clean=True)
     else:
-        pdf_final.save(chemin)
+        # Même sans compression d'images, optimiser le flux PDF
+        pdf_final.save(chemin, garbage=4, deflate=True, clean=True)
 
     return chemin
 
