@@ -198,8 +198,6 @@ def est_bloc_centre(bloc, page_largeur=595.0, tol_multi=3.0, tol_page=5.0):
 
     return False, 0
 
-
-
 def zone_effacement(page, span, police, taille):
     """
     Détecte la zone blanche exacte d'un cartouche Canva autour d'un span.
@@ -302,8 +300,6 @@ def largeur_texte(texte, fontfile, fontsize):
     """Wrapper — retourne uniquement la largeur."""
     return mesurer_texte(texte, fontfile, fontsize)[0]
 
-
-
 def personnaliser_pdf_pages(chemin_pdf, prenom_ancien, prenom_nouveau):
     doc = fitz.open(chemin_pdf)
     cache_polices = extraire_polices_pdf(doc)
@@ -388,43 +384,40 @@ def personnaliser_pdf_pages(chemin_pdf, prenom_ancien, prenom_nouveau):
 
 
 # ── Assemblage PDF final ───────────────────────────────────────────────────
-def recompresser_images_pdf(doc, qualite_jpeg: int):
+def aplatir_pdf(doc, dpi: int, qualite_jpeg: int) -> fitz.Document:
     """
-    Recompresse toutes les images PNG du PDF en JPEG avec la qualité donnée.
-    C'est la vraie compression — PyMuPDF seul ne réduit pas les images PNG.
+    Aplatit un PDF : rasterise chaque page en JPEG puis reconstruit un PDF propre.
+    Élimine tous les calques, métadonnées et redondances — réduction max de la taille.
     """
     from PIL import Image as PILImage
     import io as _io
 
-    for page in doc:
-        for img_info in page.get_images(full=True):
-            xref = img_info[0]
-            try:
-                base = doc.extract_image(xref)
-                img_bytes = base["image"]
-                ext = base.get("ext", "").lower()
+    mat      = fitz.Matrix(dpi / 72, dpi / 72)
+    doc_flat = fitz.open()
 
-                # Recompresser PNG et images volumineuses en JPEG
-                if ext in ("png", "jpg", "jpeg") and len(img_bytes) > 50_000:
-                    pil_img = PILImage.open(_io.BytesIO(img_bytes)).convert("RGB")
-                    buffer = _io.BytesIO()
-                    pil_img.save(buffer, format="JPEG",
-                                 quality=qualite_jpeg, optimize=True)
-                    doc.update_stream(xref, buffer.getvalue())
-            except Exception:
-                pass  # Ignorer les images non modifiables
-    return doc
+    for page in doc:
+        # Rasteriser la page entière
+        pix  = page.get_pixmap(matrix=mat, alpha=False)
+        img  = PILImage.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        buf  = _io.BytesIO()
+        img.save(buf, format="JPEG", quality=qualite_jpeg, optimize=True)
+        jpeg_bytes = buf.getvalue()
+
+        # Créer une nouvelle page avec les dimensions originales (en points PDF)
+        page_new = doc_flat.new_page(width=page.rect.width, height=page.rect.height)
+        page_new.insert_image(page_new.rect, stream=jpeg_bytes)
+
+    return doc_flat
 
 
 def assembler_pdf(docs, prenom, compression):
     """
-    Assemble une liste de fitz.Document en un seul PDF final.
-    docs = [doc_couverture, doc_bd] ou [doc_bd] si pas de couverture.
+    Assemble puis aplatit le PDF final.
 
-    Niveaux de compression :
-    - aucune  : assemblage simple sans retraitement
-    - moyenne : recompression JPEG q=85 + optimisation flux
-    - forte   : recompression JPEG q=55 + optimisation flux maximale
+    Niveaux :
+    - aucune  : assemblage simple, aucun retraitement
+    - moyenne : aplatissement 150dpi JPEG q=85  → ~-80%
+    - forte   : aplatissement 120dpi JPEG q=72  → ~-85%
     """
     pdf_final = fitz.open()
     for doc in docs:
@@ -434,13 +427,12 @@ def assembler_pdf(docs, prenom, compression):
     chemin = os.path.join(OUTPUT_FOLDER, nom)
 
     if compression == "forte":
-        pdf_final = recompresser_images_pdf(pdf_final, qualite_jpeg=55)
-        pdf_final.save(chemin, garbage=4, deflate=True, clean=True)
+        pdf_final = aplatir_pdf(pdf_final, dpi=120, qualite_jpeg=72)
+        pdf_final.save(chemin, garbage=4, deflate=True)
     elif compression == "moyenne":
-        pdf_final = recompresser_images_pdf(pdf_final, qualite_jpeg=85)
-        pdf_final.save(chemin, garbage=3, deflate=True, clean=True)
+        pdf_final = aplatir_pdf(pdf_final, dpi=150, qualite_jpeg=85)
+        pdf_final.save(chemin, garbage=3, deflate=True)
     else:
-        # Aucune compression — fichier original intact
         pdf_final.save(chemin)
 
     return chemin
@@ -484,14 +476,6 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 .ap-avant{flex:1;text-align:center;font-size:.88rem;font-weight:800;color:var(--doux);opacity:.5}
 .fleche{font-size:1.2rem;color:var(--orange);flex-shrink:0}
 .ap-apres{flex:1;text-align:center;font-size:.95rem;font-weight:800;color:var(--violet);min-height:1.2em}
-
-/* Options couverture */
-.section-couv{background:rgba(108,60,225,.04);border:2px solid rgba(108,60,225,.10);border-radius:12px;padding:14px;margin-bottom:14px}
-.toggle-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:0}
-.toggle-row.open{margin-bottom:12px}
-.toggle-label{font-size:.85rem;font-weight:800;color:var(--texte)}
-
-
 
 /* Compression */
 .comp-row{display:flex;gap:8px;margin-bottom:14px}
@@ -568,8 +552,8 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
   <div class="header">
     <div class="badge">EnfantProdige</div>
     <h1 class="titre">BD <span>Personnalisée</span></h1>
-    <p class="sous-titre">Couverture + BD personnalisée = PDF prêt à envoyer ✨</p>
-    <div class="version-badge">v11/05/2026 14:05</div>
+    <p class="sous-titre">BD personnalisée = PDF prêt à envoyer ✨</p>
+    <div class="version-badge">v15/05/2026 08:40</div>
   </div>
 
   <!-- Onglets -->
@@ -665,45 +649,6 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
     <label class="label">Prénom placeholder dans les pages</label>
     <input type="text" class="champ-nom" id="prenom-bd" placeholder="Ex : WILLIAM">
 
-    <div class="sep"></div>
-
-    <!-- === COUVERTURE === -->
-    <label class="label">Couverture (optionnel)</label>
-
-    <!-- Type couverture -->
-    <div class="comp-row" style="margin-bottom:12px">
-      <button class="comp-btn actif" id="btn-couv-sep" onclick="setTypeCouv('separee',this)">📄 Séparée</button>
-      <button class="comp-btn" id="btn-couv-int" onclick="setTypeCouv('integree',this)">📋 Intégrée</button>
-      <button class="comp-btn" id="btn-couv-bd" onclick="setTypeCouv('avec_bd',this)">📦 Couv + BD ensemble</button>
-    </div>
-    <div id="hint-type-couv" style="font-size:.72rem;color:var(--doux);margin-bottom:12px">
-      La couverture est un PDF Canva séparé des pages BD
-    </div>
-
-    <!-- Zone couverture (cachée si intégrée ou avec_bd) -->
-    <div id="zone-couv-wrapper">
-      <!-- Upload couverture -->
-      <div id="src-upload-couv">
-        <div class="zone-upload" id="zone-couv-biblio">
-          <input type="file" id="input-couv-biblio" accept=".pdf">
-          <span class="icone">🎨</span>
-          <div class="lbl">Glisse la couverture ici</div>
-          <div class="sub">PDF Canva avec le prénom</div>
-          <div class="nom-fichier" id="nom-couv-fich"></div>
-        </div>
-      </div>
-
-      <!-- Drive couverture -->
-      <div id="src-drive-couv" style="display:none">
-        <input type="text" class="champ-nom" id="lien-drive-couv"
-          placeholder="https://drive.google.com/file/d/…/view">
-      </div>
-
-      <label class="label">Prénom placeholder sur la couverture</label>
-      <input type="text" class="champ-nom" id="prenom-couv-bd"
-        placeholder="Ex : WILLIAM (laisser vide = même que pages)">
-    </div>
-
     <button class="btn-sm" id="btn-upload-bd" onclick="uploadBD()">➕ Ajouter à la bibliothèque</button>
     <div class="progress-wrap" id="progress-wrap" style="display:none;margin-top:12px">
       <div class="progress-bar" id="progress-bar"></div>
@@ -733,9 +678,6 @@ function changerOnglet(id, btn) {
   if (id === 'biblio') chargerListe();
 }
 
-// ── Toggle couverture ─────────────────────────────────────────────────────────
-
-
 // ── Compression ───────────────────────────────────────────────────────────────
 function setComp(val, btn) {
   compression = val;
@@ -758,15 +700,7 @@ inputPdf.addEventListener('change', () => {
   }
 });
 
-document.getElementById('input-couv-biblio').addEventListener('change', function() {
-  const f = this.files[0];
-  if (f) {
-    document.getElementById('zone-couv-biblio').classList.add('ok');
-    const el = document.getElementById('nom-couv-fich');
-    el.style.display = 'block';
-    el.textContent = '✓ ' + f.name;
-  }
-});
+
 zoneUp.addEventListener('dragover', e => { e.preventDefault(); zoneUp.classList.add('survol'); });
 zoneUp.addEventListener('dragleave', () => zoneUp.classList.remove('survol'));
 zoneUp.addEventListener('drop', e => {
@@ -781,34 +715,14 @@ zoneUp.addEventListener('drop', e => {
   }
 });
 
-let typeCouv  = 'separee';
 let srcMode   = 'upload';  // 'upload' ou 'drive'
 
 function setSource(val, btn) {
   srcMode = val;
   document.querySelectorAll('#btn-src-upload, #btn-src-drive').forEach(b => b.classList.remove('actif'));
   btn.classList.add('actif');
-  // Pages BD
-  document.getElementById('src-upload-bd').style.display   = val === 'upload' ? 'block' : 'none';
-  document.getElementById('src-drive-bd').style.display    = val === 'drive'  ? 'block' : 'none';
-  // Couverture
-  document.getElementById('src-upload-couv').style.display = val === 'upload' ? 'block' : 'none';
-  document.getElementById('src-drive-couv').style.display  = val === 'drive'  ? 'block' : 'none';
-}
-
-function setTypeCouv(val, btn) {
-  typeCouv = val;
-  document.querySelectorAll('#btn-couv-sep, #btn-couv-int, #btn-couv-bd').forEach(b => b.classList.remove('actif'));
-  btn.classList.add('actif');
-  const hints = {
-    separee:  'La couverture est un PDF Canva séparé des pages BD',
-    integree: 'La couverture est déjà incluse comme 1ère page du document BD',
-    avec_bd:  'Upload un seul PDF contenant couverture + pages BD ensemble'
-  };
-  document.getElementById('hint-type-couv').textContent = hints[val];
-  // Masquer la zone couverture si intégrée ou avec_bd
-  const cachee = val === 'integree' || val === 'avec_bd';
-  document.getElementById('zone-couv-wrapper').style.display = cachee ? 'none' : 'block';
+  document.getElementById('src-upload-bd').style.display = val === 'upload' ? 'block' : 'none';
+  document.getElementById('src-drive-bd').style.display  = val === 'drive'  ? 'block' : 'none';
 }
 
 function setProgress(pct, label) {
@@ -819,16 +733,14 @@ function setProgress(pct, label) {
 async function uploadBD() {
   const nom        = document.getElementById('nom-bd').value.trim();
   const prenom     = document.getElementById('prenom-bd').value.trim();
-  const prenomCouv = document.getElementById('prenom-couv-bd').value.trim();
+
   const msgEl      = document.getElementById('msg-upload');
   const btn        = document.getElementById('btn-upload-bd');
   msgEl.className  = 'msg';
 
   // Récupérer les sources selon le mode
   const f        = inputPdf.files[0];
-  const fCouv    = document.getElementById('input-couv-biblio').files[0];
   const lienBd   = document.getElementById('lien-drive-bd').value.trim();
-  const lienCouv = document.getElementById('lien-drive-couv').value.trim();
 
   if (srcMode === 'upload' && !f)    { affMsg(msgEl,'Choisis le PDF des pages.','err'); return; }
   if (srcMode === 'drive'  && !lienBd){ affMsg(msgEl,'Colle un lien Google Drive pour les pages.','err'); return; }
@@ -843,15 +755,10 @@ async function uploadBD() {
   const fd = new FormData();
   fd.append('nom', nom);
   fd.append('prenom', prenom);
-  fd.append('prenom_couv', prenomCouv || prenom);
-  fd.append('type_couv', typeCouv);
-
   if (srcMode === 'upload') {
     fd.append('pdf', f);
-    if (fCouv && typeCouv === 'separee') fd.append('couverture', fCouv);
   } else {
     fd.append('lien_drive_bd', lienBd);
-    if (lienCouv && typeCouv === 'separee') fd.append('lien_drive_couv', lienCouv);
   }
 
   setProgress(30, 'Envoi en cours…');
@@ -876,16 +783,11 @@ async function uploadBD() {
 
     // Reset
     if (inputPdf) inputPdf.value = '';
-    document.getElementById('input-couv-biblio').value = '';
     document.getElementById('lien-drive-bd').value = '';
-    document.getElementById('lien-drive-couv').value = '';
     if (zoneUp) zoneUp.classList.remove('ok');
-    document.getElementById('zone-couv-biblio').classList.remove('ok');
     if (nomFich) nomFich.style.display = 'none';
-    document.getElementById('nom-couv-fich').style.display = 'none';
     document.getElementById('nom-bd').value = '';
     document.getElementById('prenom-bd').value = '';
-    document.getElementById('prenom-couv-bd').value = '';
     chargerListe(); chargerSelectBD();
 
   } catch(e) {
@@ -911,7 +813,7 @@ async function chargerListe() {
       <div>
         <div class="bd-nom">📖 ${bd.nom}</div>
         <div class="bd-prenom">Héros : ${bd.prenom}</div>
-        ${bd.couverture ? '<div class="bd-couv">🎨 Couverture PDF incluse</div>' : ''}
+        ${bd.source === 'upload' ? '' : '<div class="bd-couv">🔗 Source : Google Drive</div>'}
       </div>
       <button class="bd-suppr" onclick="supprimerBD('${bd.id}')">🗑</button>
     </div>`).join('');
@@ -934,7 +836,6 @@ async function chargerSelectBD() {
     const opt = document.createElement('option');
     opt.value = bd.id; opt.textContent = bd.nom;
     opt.dataset.prenom = bd.prenom;
-    opt.dataset.prompt = bd.prompt_couv || '';
     sel.appendChild(opt);
   });
   if (val) sel.value = val;
@@ -1013,7 +914,7 @@ async function generer() {
               document.getElementById('loader').classList.remove('actif');
               document.getElementById('res-titre').textContent = 'PDF de ' + prenom_cap + ' prêt ! 🎉';
               document.getElementById('res-info').textContent =
-                evt.pages + ' pages · ' + (evt.avec_couverture ? 'Couverture incluse · ' : '') + 'Compression ' + compression;
+                evt.pages + ' pages · Compression ' + compression;
               document.getElementById('res-taille').textContent = '📦 ' + evt.taille_mo + ' Mo';
               document.getElementById('btn-dl').href = '/telecharger/' + evt.fichier;
               document.getElementById('btn-dl').download = 'BD_' + prenom_cap + '.pdf';
@@ -1070,22 +971,18 @@ def index():
 @app.route("/ajouter-bd", methods=["POST"])
 def ajouter_bd():
     fichier      = request.files.get("pdf")
-    couv_fichier = request.files.get("couverture")
-    lien_bd      = request.form.get("lien_drive_bd","").strip()
-    lien_couv    = request.form.get("lien_drive_couv","").strip()
-    nom          = request.form.get("nom","").strip()
-    prenom_bd    = request.form.get("prenom","").strip().upper()
-    prenom_couv  = request.form.get("prenom_couv","").strip().upper()
+    lien_bd   = request.form.get("lien_drive_bd","").strip()
+    nom       = request.form.get("nom","").strip()
+    prenom_bd = request.form.get("prenom","").strip().upper()
 
     if not nom or not prenom_bd:
         return jsonify({"erreur":"Nom et prénom obligatoires"}), 400
     if not fichier and not lien_bd:
-        return jsonify({"erreur":"Fournis un fichier PDF ou un lien Google Drive pour les pages BD"}), 400
+        return jsonify({"erreur":"Fournis un fichier PDF ou un lien Google Drive"}), 400
 
-    bd_id = uuid.uuid4().hex[:10]
-
-    # ── Pages BD ──────────────────────────────────────────────────────────
+    bd_id     = uuid.uuid4().hex[:10]
     chemin_bd = os.path.join(BIBLIO_FOLDER, f"{bd_id}_bd.pdf")
+
     if fichier:
         fichier.save(chemin_bd)
     elif lien_bd:
@@ -1093,34 +990,15 @@ def ajouter_bd():
             chemin_tmp = telecharger_drive(lien_bd)
             os.rename(chemin_tmp, chemin_bd)
         except Exception as e:
-            return jsonify({"erreur": f"Erreur téléchargement BD : {str(e)}"}), 400
-
-    # ── Couverture ────────────────────────────────────────────────────────
-    chemin_couv_nom = None
-    if couv_fichier:
-        chemin_couv = os.path.join(BIBLIO_FOLDER, f"{bd_id}_couv.pdf")
-        couv_fichier.save(chemin_couv)
-        chemin_couv_nom = f"{bd_id}_couv.pdf"
-    elif lien_couv:
-        try:
-            chemin_tmp = telecharger_drive(lien_couv)
-            chemin_couv = os.path.join(BIBLIO_FOLDER, f"{bd_id}_couv.pdf")
-            os.rename(chemin_tmp, chemin_couv)
-            chemin_couv_nom = f"{bd_id}_couv.pdf"
-        except Exception as e:
-            return jsonify({"erreur": f"Erreur téléchargement couverture : {str(e)}"}), 400
+            return jsonify({"erreur": f"Erreur téléchargement : {str(e)}"}), 400
 
     meta = lire_meta()
     meta[bd_id] = {
-        "id":          bd_id,
-        "nom":         nom,
-        "prenom":      prenom_bd,
-        "prenom_couv": prenom_couv or prenom_bd,
-        "pages":       f"{bd_id}_bd.pdf",
-        "couverture":  chemin_couv_nom,
-        "type_couv":   request.form.get("type_couv", "separee"),
-        "source_bd":   lien_bd or "upload",
-        "source_couv": lien_couv or ("upload" if couv_fichier else None)
+        "id":       bd_id,
+        "nom":      nom,
+        "prenom":   prenom_bd,
+        "pages":    f"{bd_id}_bd.pdf",
+        "source":   lien_bd or "upload"
     }
     ecrire_meta(meta)
     return jsonify({"succes":True,"id":bd_id})
@@ -1145,8 +1023,12 @@ def liste_bds():
 def supprimer_bd(bd_id):
     meta = lire_meta()
     if bd_id not in meta: return jsonify({"erreur":"BD introuvable"}), 404
-    chemin = os.path.join(BIBLIO_FOLDER, meta[bd_id]["fichier"])
-    if os.path.exists(chemin): os.remove(chemin)
+    bd = meta[bd_id]
+    # Supprimer le fichier PDF
+    nom_fichier = bd.get("pages") or bd.get("fichier", "")
+    if nom_fichier:
+        chemin = os.path.join(BIBLIO_FOLDER, nom_fichier)
+        if os.path.exists(chemin): os.remove(chemin)
     del meta[bd_id]
     ecrire_meta(meta)
     return jsonify({"succes":True})
@@ -1169,31 +1051,12 @@ def _stream_generer(bd_id, prenom_nouveau, compression):
     nom_pages     = bd.get("pages") or bd.get("fichier","")
     chemin_bd     = os.path.join(BIBLIO_FOLDER, nom_pages)
     prenom_ancien = bd["prenom"]
-    type_couv     = bd.get("type_couv", "separee")
-
     if not os.path.exists(chemin_bd):
         yield evt(0, "Erreur", {"erreur": f"Fichier BD introuvable : {nom_pages}"})
         return
 
     docs_a_assembler = []
-
-    # ── Étape 1 : Couverture ───────────────────────────────────────────────
-    if type_couv == "avec_bd":
-        yield evt(10, "📦 Couverture intégrée dans le document BD…")
-    elif bd.get("couverture") and type_couv == "separee":
-        chemin_couv = os.path.join(BIBLIO_FOLDER, bd["couverture"])
-        if os.path.exists(chemin_couv):
-            yield evt(10, "🎨 Personnalisation de la couverture…")
-            try:
-                prenom_couv_ancien = bd.get("prenom_couv") or prenom_ancien
-                doc_couv, _ = personnaliser_pdf_pages(chemin_couv, prenom_couv_ancien, prenom_nouveau)
-                docs_a_assembler.append(doc_couv)
-                yield evt(30, "✅ Couverture personnalisée")
-            except Exception as e:
-                yield evt(0, "Erreur", {"erreur": f"Erreur couverture : {str(e)}"})
-                return
-    else:
-        yield evt(10, "📄 Pas de couverture séparée…")
+    yield evt(10, "📄 Fichier BD chargé…")
 
     # ── Étape 2 : Pages BD ─────────────────────────────────────────────────
     yield evt(35, f"📝 Remplacement de « {prenom_ancien} » par « {prenom_nouveau} »…")
@@ -1211,7 +1074,7 @@ def _stream_generer(bd_id, prenom_nouveau, compression):
     yield evt(65, f"✅ {nb} occurrence(s) remplacée(s) dans la BD")
 
     # ── Étape 3 : Assemblage ───────────────────────────────────────────────
-    yield evt(70, "📎 Assemblage couverture + pages…")
+    yield evt(70, "📎 Assemblage du PDF…")
     try:
         chemin_final = assembler_pdf(docs_a_assembler, prenom_nouveau, compression)
     except Exception as e:
@@ -1342,25 +1205,11 @@ def traiter_commande(sale_id: str, prenom: str, email_client: str,
     nom_pages     = bd.get("pages") or bd.get("fichier", "")
     chemin_bd     = os.path.join(BIBLIO_FOLDER, nom_pages)
     prenom_ancien = bd["prenom"]
-    type_couv     = bd.get("type_couv", "separee")
-
     if not os.path.exists(chemin_bd):
         print(f"❌ Fichier BD introuvable : {chemin_bd}")
         return
 
     docs = []
-
-    # Couverture
-    if bd.get("couverture") and type_couv == "separee":
-        chemin_couv = os.path.join(BIBLIO_FOLDER, bd["couverture"])
-        if os.path.exists(chemin_couv):
-            try:
-                prenom_couv_ancien = bd.get("prenom_couv") or prenom_ancien
-                doc_couv, _ = personnaliser_pdf_pages(chemin_couv, prenom_couv_ancien, prenom)
-                docs.append(doc_couv)
-            except Exception as e:
-                print(f"❌ Erreur couverture : {e}")
-
     # Pages BD
     try:
         doc_bd, nb = personnaliser_pdf_pages(chemin_bd, prenom_ancien, prenom)
@@ -1481,23 +1330,10 @@ def api_generer_bd():
     nom_pages     = bd.get("pages") or bd.get("fichier", "")
     chemin_bd     = os.path.join(BIBLIO_FOLDER, nom_pages)
     prenom_ancien = bd["prenom"]
-    type_couv     = bd.get("type_couv", "separee")
-
     if not os.path.exists(chemin_bd):
         return jsonify({"erreur": "Fichier BD introuvable sur le serveur"}), 404
 
     docs = []
-
-    # Couverture
-    if bd.get("couverture") and type_couv == "separee":
-        chemin_couv = os.path.join(BIBLIO_FOLDER, bd["couverture"])
-        if os.path.exists(chemin_couv):
-            try:
-                prenom_couv_ancien = bd.get("prenom_couv") or prenom_ancien
-                doc_couv, _ = personnaliser_pdf_pages(chemin_couv, prenom_couv_ancien, prenom)
-                docs.append(doc_couv)
-            except Exception as e:
-                return jsonify({"erreur": f"Erreur couverture : {str(e)}"}), 500
 
     # Pages BD
     try:
