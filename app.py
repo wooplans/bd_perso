@@ -1,11 +1,200 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, Response, stream_with_context, make_response
 import fitz
-import re, os, uuid, json, glob, tempfile
-import urllib.request
+import re, os, uuid, json, glob, tempfile, threading
+import urllib.request, urllib.error
 
 app = Flask(__name__)
 
 BIBLIO_FOLDER = "./bibliotheque"
+
+# ── Supabase config ───────────────────────────────────────────────────────────
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+
+def _sb_ok():
+    return bool(SUPABASE_URL and SUPABASE_KEY)
+
+def _sb_req(method, path, data=None, content_type="application/json",
+            extra_headers=None, timeout=30):
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Accept": "application/json",
+    }
+    if content_type:
+        headers["Content-Type"] = content_type
+    if method in ("POST", "PATCH") and "/rest/" in path:
+        headers["Prefer"] = "return=representation"
+    if extra_headers:
+        headers.update(extra_headers)
+    body = None
+    if data is not None:
+        body = json.dumps(data, ensure_ascii=False).encode() if isinstance(data, (dict, list)) else data
+    req = urllib.request.Request(
+        f"{SUPABASE_URL}{path}", data=body, headers=headers, method=method
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+        try:
+            return json.loads(raw) if raw else None
+        except Exception:
+            return raw
+
+def _sb_upload_pdf(bd_id: str, chemin_local: str) -> bool:
+    if not _sb_ok(): return False
+    try:
+        with open(chemin_local, "rb") as f:
+            data = f.read()
+        _sb_req("POST", f"/storage/v1/object/bd-bibliotheque/{bd_id}_bd.pdf",
+                data=data, content_type="application/pdf",
+                extra_headers={"x-upsert": "true"}, timeout=120)
+        print(f"✅ Storage upload : {bd_id}_bd.pdf")
+        return True
+    except Exception as e:
+        print(f"⚠️ Storage upload erreur : {e}")
+        return False
+
+def _sb_download_pdf(bd_id: str, chemin_local: str) -> bool:
+    if not _sb_ok(): return False
+    try:
+        url = f"{SUPABASE_URL}/storage/v1/object/public/bd-bibliotheque/{bd_id}_bd.pdf"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = resp.read()
+        if data[:4] != b"%PDF": return False
+        with open(chemin_local, "wb") as f:
+            f.write(data)
+        print(f"✅ Storage download : {bd_id}_bd.pdf")
+        return True
+    except Exception as e:
+        print(f"⚠️ Storage download erreur : {e}")
+        return False
+
+def _sb_delete_pdf(bd_id: str):
+    if not _sb_ok(): return
+    try:
+        _sb_req("DELETE", f"/storage/v1/object/bd-bibliotheque/{bd_id}_bd.pdf",
+                content_type=None, timeout=15)
+    except Exception:
+        pass
+
+def sync_depuis_supabase():
+    if not _sb_ok(): return
+    try:
+        rows = _sb_req("GET", "/rest/v1/bd_bibliotheque?select=*&order=created_at.asc",
+                       content_type=None)
+        if not isinstance(rows, list): return
+        meta = {}
+        for r in rows:
+            bid = r["id"]
+            meta[bid] = {
+                "id":        bid,
+                "nom":       r["nom"],
+                "prenom":    r["prenom"],
+                "pages":     r.get("pages") or f"{bid}_bd.pdf",
+                "source":    r.get("source", "upload"),
+                "drive_url": r.get("drive_url", ""),
+            }
+        ecrire_meta(meta)
+        print(f"✅ Supabase sync : {len(meta)} BD(s)")
+    except Exception as e:
+        print(f"⚠️ Supabase sync erreur : {e}")
+
+def ajouter_bd_supabase(bd: dict):
+    if not _sb_ok(): return
+    try:
+        _sb_req("POST", "/rest/v1/bd_bibliotheque", data={
+            "id": bd["id"], "nom": bd["nom"], "prenom": bd["prenom"],
+            "pages": bd.get("pages", ""), "source": bd.get("source", "upload"),
+            "drive_url": bd.get("drive_url", ""),
+        })
+    except Exception as e:
+        print(f"⚠️ ajouter_bd_supabase erreur : {e}")
+
+def supprimer_bd_supabase(bd_id: str):
+    if not _sb_ok(): return
+    try:
+        _sb_req("DELETE", f"/rest/v1/bd_bibliotheque?id=eq.{bd_id}", content_type=None)
+    except Exception as e:
+        print(f"⚠️ supprimer_bd_supabase erreur : {e}")
+
+# ── Commandes / Historique ────────────────────────────────────────────────────
+_commandes_status = {}
+_commandes_lock   = threading.Lock()
+
+def _cmd_set(sale_id: str, **kwargs):
+    with _commandes_lock:
+        if sale_id not in _commandes_status:
+            _commandes_status[sale_id] = {}
+        _commandes_status[sale_id].update(kwargs)
+
+def _cmd_get(sale_id: str) -> dict:
+    with _commandes_lock:
+        return _commandes_status.get(sale_id, {}).copy()
+
+def _enregistrer_generation(prenom, bd_nom, bd_id, fichier, taille_mo, nb_pages,
+                             source="manuel", email="", sale_id=None):
+    if not _sb_ok(): return
+    try:
+        from datetime import datetime as _dt
+        _sb_req("POST", "/rest/v1/bd_commandes", data={
+            "sale_id":      sale_id or f"man_{uuid.uuid4().hex[:8]}",
+            "prenom":       prenom, "bd_id": bd_id, "bd_nom": bd_nom,
+            "email":        email,  "statut": "pret",
+            "fichier":      fichier, "taille_mo": taille_mo, "nb_pages": nb_pages,
+            "source":       source,
+            "completed_at": _dt.utcnow().isoformat() + "Z",
+        })
+    except Exception as e:
+        print(f"⚠️ _enregistrer_generation erreur : {e}")
+
+def _enregistrer_commande_webhook(sale_id, prenom, email, bd_id, bd_nom):
+    if not _sb_ok(): return
+    try:
+        _sb_req("POST", "/rest/v1/bd_commandes", data={
+            "sale_id": sale_id, "prenom": prenom, "email": email,
+            "bd_id": bd_id, "bd_nom": bd_nom, "statut": "en_cours", "source": "webhook",
+        })
+    except Exception as e:
+        print(f"⚠️ _enregistrer_commande_webhook erreur : {e}")
+
+def _mettre_a_jour_commande(sale_id, **kwargs):
+    if not _sb_ok(): return
+    try:
+        from datetime import datetime as _dt
+        updates = dict(kwargs)
+        if updates.get("statut") in ("pret", "erreur"):
+            updates["completed_at"] = _dt.utcnow().isoformat() + "Z"
+        _sb_req("PATCH",
+                f"/rest/v1/bd_commandes?sale_id=eq.{sale_id}&statut=eq.en_cours",
+                data=updates)
+    except Exception as e:
+        print(f"⚠️ _mettre_a_jour_commande erreur : {e}")
+
+# ── PDF local — assurer présence ──────────────────────────────────────────────
+def assurer_pdf_local(bd_id: str, bd: dict):
+    nom    = bd.get("pages") or f"{bd_id}_bd.pdf"
+    chemin = os.path.join(BIBLIO_FOLDER, nom)
+    if os.path.exists(chemin) and os.path.getsize(chemin) > 100:
+        return chemin
+    if _sb_download_pdf(bd_id, chemin): return chemin
+    drive_url = bd.get("drive_url", "")
+    if drive_url:
+        try:
+            if "drive.google.com" in drive_url:
+                tmp = telecharger_drive(drive_url)
+                os.rename(tmp, chemin)
+            else:
+                req = urllib.request.Request(drive_url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    data = resp.read()
+                if data[:4] == b"%PDF":
+                    with open(chemin, "wb") as f: f.write(data)
+            if os.path.exists(chemin) and os.path.getsize(chemin) > 100:
+                return chemin
+        except Exception as e:
+            print(f"⚠️ assurer_pdf_local Drive erreur {bd_id}: {e}")
+    return None
 
 def telecharger_drive(url: str, suffixe: str = ".pdf") -> str:
     """
@@ -59,6 +248,71 @@ META_FILE     = "./bibliotheque/meta.json"
 
 os.makedirs(BIBLIO_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+# ── BDs par défaut — téléchargées au démarrage si absentes ───────────────
+BDS_DEFAUT = [
+    {
+        "id":    "adg_tome1_ver1",
+        "nom":   "ADG tome1 ver1",
+        "prenom": "JOSEPH",
+        "drive": "https://drive.google.com/uc?export=download&id=10Cd6JA7PwwxlPHclq5NXQWrpDf30-uKw&confirm=t"
+    },
+]
+
+def initialiser_bds_defaut():
+    """
+    Vérifie que les BDs par défaut sont présentes dans la bibliothèque.
+    Si absentes (1er démarrage ou redéploiement Render), les télécharge
+    automatiquement depuis Google Drive.
+    """
+    meta = lire_meta()
+    changed = False
+
+    for bd in BDS_DEFAUT:
+        bd_id  = bd["id"]
+        chemin = os.path.join(BIBLIO_FOLDER, f"{bd_id}_bd.pdf")
+
+        if bd_id in meta and os.path.exists(chemin):
+            print(f"✅ BD présente : {bd['nom']}")
+            continue
+
+        print(f"⬇️  Téléchargement : {bd['nom']}…")
+        try:
+            import urllib.request as _req
+            req = _req.Request(
+                bd["drive"],
+                headers={"User-Agent": "Mozilla/5.0 (compatible; EnfantProdige/1.0)"}
+            )
+            with _req.urlopen(req, timeout=120) as resp:
+                data = resp.read()
+
+            if data[:4] != b"%PDF":
+                print(f"⚠️  Réponse non-PDF pour {bd['nom']} — ignoré")
+                continue
+
+            with open(chemin, "wb") as f:
+                f.write(data)
+
+            bd_entry = {
+                "id":        bd_id,
+                "nom":       bd["nom"],
+                "prenom":    bd["prenom"],
+                "pages":     f"{bd_id}_bd.pdf",
+                "source":    "drive_defaut",
+                "drive_url": bd["drive"],
+            }
+            meta[bd_id] = bd_entry
+            changed = True
+            print(f"✅ {bd['nom']} chargée ({len(data)//1024} Ko)")
+            # Sync vers Supabase
+            threading.Thread(target=ajouter_bd_supabase, args=(bd_entry,), daemon=True).start()
+            threading.Thread(target=_sb_upload_pdf, args=(bd_id, chemin), daemon=True).start()
+
+        except Exception as e:
+            print(f"⚠️  Impossible de charger {bd['nom']} : {e}")
+
+    if changed:
+        ecrire_meta(meta)
 
 # ── Police ─────────────────────────────────────────────────────────────────
 def _trouver_police():
@@ -384,76 +638,108 @@ def personnaliser_pdf_pages(chemin_pdf, prenom_ancien, prenom_nouveau):
 
 
 # ── Assemblage PDF final ───────────────────────────────────────────────────
-def compresser_images_pdf(doc, qualite_jpeg: int, max_dim: int = 0):
+def compresser_via_ilovepdf(chemin_pdf: str, niveau: str) -> str:
     """
-    Recompresse toutes les images PNG/JPEG d'un PDF en JPEG optimisé.
-    - qualite_jpeg : qualité JPEG (1-100)
-    - max_dim      : redimensionner si une dimension dépasse cette valeur (0 = pas de resize)
+    Compresse un PDF via l'API iLovePDF.
+    niveau : "low" | "recommended" | "extreme"
+    Retourne le chemin du PDF compressé.
+    Lève une exception si la clé API n'est pas configurée.
     """
-    from PIL import Image as PILImage
-    import io as _io
+    import urllib.request as _req, urllib.parse as _parse
+    import json as _json, jwt as _jwt, time as _time
 
-    for page_num in range(len(doc)):
-        for img_info in doc.get_page_images(page_num, full=True):
-            xref = img_info[0]
-            try:
-                base = doc.extract_image(xref)
-                data = base["image"]
-                if len(data) < 3000:
-                    continue  # ignorer les petites images (icônes, etc.)
+    if not ILOVEPDF_PUBLIC or not ILOVEPDF_SECRET:
+        raise ValueError("Clés iLovePDF non configurées (ILOVEPDF_PUBLIC_KEY / ILOVEPDF_SECRET_KEY)")
 
-                img = PILImage.open(_io.BytesIO(data)).convert("RGB")
-                w, h = img.size
+    headers_auth = {"Content-Type": "application/json"}
 
-                # Redimensionner si demandé
-                if max_dim > 0 and max(w, h) > max_dim:
-                    ratio = max_dim / max(w, h)
-                    img = img.resize((int(w * ratio), int(h * ratio)), PILImage.LANCZOS)
+    def make_jwt(extra=None):
+        payload = {"iss": ILOVEPDF_PUBLIC, "iat": int(_time.time()), "nbf": int(_time.time())-10}
+        if extra:
+            payload.update(extra)
+        return _jwt.encode(payload, ILOVEPDF_SECRET, algorithm="HS256")
 
-                buf = _io.BytesIO()
-                img.save(buf, format="JPEG", quality=qualite_jpeg, optimize=True)
-                new_data = buf.getvalue()
+    def api_post(url, data, token):
+        body = _json.dumps(data).encode()
+        req  = _req.Request(url, data=body, headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type":  "application/json"
+        }, method="POST")
+        with _req.urlopen(req, timeout=60) as resp:
+            return _json.loads(resp.read())
 
-                # Ne remplacer que si ça réduit vraiment
-                if len(new_data) < len(data):
-                    doc.update_stream(xref, new_data)
+    def api_get(url, token):
+        req = _req.Request(url, headers={"Authorization": f"Bearer {token}"})
+        with _req.urlopen(req, timeout=60) as resp:
+            return resp.read()
 
-            except Exception:
-                pass
+    # ── Étape 1 : Start task ─────────────────────────────────────────────
+    token  = make_jwt()
+    start  = api_post("https://api.ilovepdf.com/v1/start/compress", {}, token)
+    server = start["server"]
+    task   = start["task"]
 
-    return doc
+    # ── Étape 2 : Upload ─────────────────────────────────────────────────
+    import urllib.request as _req2
+    boundary = uuid.uuid4().hex
+    nom_fichier = os.path.basename(chemin_pdf)
 
+    with open(chemin_pdf, "rb") as f:
+        pdf_data = f.read()
 
-def aplatir_pdf(doc, dpi: int, qualite_jpeg: int) -> fitz.Document:
-    """
-    Aplatit un PDF : rasterise chaque page en JPEG puis reconstruit un PDF.
-    Élimine tous les calques et redondances — réduction maximale.
-    """
-    from PIL import Image as PILImage
-    import io as _io
+    body = (
+        b"--" + boundary.encode() + b"\r\n"
+        b'Content-Disposition: form-data; name="task"\r\n\r\n' +
+        task.encode() + b"\r\n" +
+        b"--" + boundary.encode() + b"\r\n" +
+        f'Content-Disposition: form-data; name="file"; filename="{nom_fichier}"\r\n'.encode() +
+        b"Content-Type: application/pdf\r\n\r\n"
+    ) + pdf_data + b"\r\n--" + boundary.encode() + b"--\r\n"
 
-    mat      = fitz.Matrix(dpi / 72, dpi / 72)
-    doc_flat = fitz.open()
+    req_upload = _req2.Request(
+        f"https://{server}/v1/upload",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {make_jwt()}",
+            "Content-Type":  f"multipart/form-data; boundary={boundary}"
+        },
+        method="POST"
+    )
+    with _req2.urlopen(req_upload, timeout=120) as resp:
+        upload_result = _json.loads(resp.read())
+    server_filename = upload_result["server_filename"]
 
-    for page in doc:
-        pix  = page.get_pixmap(matrix=mat, alpha=False)
-        img  = PILImage.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        buf  = _io.BytesIO()
-        img.save(buf, format="JPEG", quality=qualite_jpeg, optimize=True)
-        page_new = doc_flat.new_page(width=page.rect.width, height=page.rect.height)
-        page_new.insert_image(page_new.rect, stream=buf.getvalue())
+    # ── Étape 3 : Process ────────────────────────────────────────────────
+    api_post(f"https://{server}/v1/process", {
+        "task":              task,
+        "tool":              "compress",
+        "files":             [{"server_filename": server_filename, "filename": nom_fichier}],
+        "compression_level": niveau
+    }, make_jwt())
 
-    return doc_flat
+    # ── Étape 4 : Download ───────────────────────────────────────────────
+    pdf_compresse = api_get(f"https://{server}/v1/download/{task}", make_jwt())
+
+    nom_sortie = chemin_pdf.replace(".pdf", f"_compressed.pdf")
+    with open(nom_sortie, "wb") as f:
+        f.write(pdf_compresse)
+
+    # Vérifier que c'est bien un PDF et qu'il est plus petit
+    if pdf_compresse[:4] != b"%PDF":
+        raise ValueError("iLovePDF a retourné un fichier invalide")
+
+    print(f"✅ iLovePDF : {len(pdf_data)//1024}Ko → {len(pdf_compresse)//1024}Ko (-{(1-len(pdf_compresse)/len(pdf_data))*100:.0f}%)")
+    return nom_sortie
 
 
 def assembler_pdf(docs, prenom, compression):
     """
-    Assemble et compresse le PDF final.
+    Assemble le PDF final puis le compresse via iLovePDF API.
 
     Niveaux :
-    - aucune  : assemblage simple, aucun retraitement
-    - moyenne : recompression JPEG q=70 + resize max 1200px → ~-75%
-    - forte   : aplatissement complet 150dpi JPEG q=80 → ~-85%
+    - aucune      : assemblage simple, optimisation flux basique
+    - moyenne     : iLovePDF niveau "recommended"
+    - forte       : iLovePDF niveau "extreme"
     """
     pdf_final = fitz.open()
     for doc in docs:
@@ -462,23 +748,34 @@ def assembler_pdf(docs, prenom, compression):
     nom    = f"BD_{prenom.capitalize()}_{uuid.uuid4().hex[:6]}.pdf"
     chemin = os.path.join(OUTPUT_FOLDER, nom)
 
-    if compression == "forte":
-        # Aplatissement complet : rasterise tout → JPEG
-        pdf_final = aplatir_pdf(pdf_final, dpi=150, qualite_jpeg=80)
-        pdf_final.save(chemin, garbage=4, deflate=True)
-    elif compression == "moyenne":
-        # Recompression intelligente : garde le texte vectoriel
-        pdf_final = compresser_images_pdf(pdf_final, qualite_jpeg=70, max_dim=1200)
-        pdf_final.save(chemin, garbage=4, deflate=True, clean=True)
-    else:
-        # Même sans compression d'images, optimiser le flux PDF
-        pdf_final.save(chemin, garbage=4, deflate=True, clean=True)
+    # Sauvegarder d'abord avec optimisation de base
+    pdf_final.save(chemin, garbage=4, deflate=True, clean=True)
+
+    if compression in ("moyenne", "forte"):
+        niveau_ilove = "recommended" if compression == "moyenne" else "extreme"
+        try:
+            chemin_compresse = compresser_via_ilovepdf(chemin, niveau_ilove)
+            # Remplacer le fichier original par le compressé
+            os.replace(chemin_compresse, chemin)
+        except Exception as e:
+            # Si iLovePDF échoue, on garde le fichier non compressé
+            print(f"⚠️  iLovePDF compression échouée : {e} — fichier non compressé livré")
 
     return chemin
 
 # ══════════════════════════════════════════════════════════════════════════════
 # HTML
 # ══════════════════════════════════════════════════════════════════════════════
+# ── Initialisation au démarrage (Gunicorn + mode direct) ─────────────────
+try:
+    sync_depuis_supabase()   # P1 : récupère la méta depuis Supabase
+except Exception as _e:
+    print(f"⚠️  Supabase sync : {_e}")
+try:
+    initialiser_bds_defaut() # BDs par défaut si absentes
+except Exception as _e:
+    print(f"⚠️  Init BDs par défaut : {_e}")
+
 HTML = r"""<!DOCTYPE html>
 <html lang="fr">
 <head>
@@ -581,6 +878,11 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 .progress-bar{height:100%;background:linear-gradient(90deg,var(--violet),var(--vert));width:0%;transition:width .3s;border-radius:10px}
 .progress-label{font-size:.75rem;font-weight:700;color:var(--doux);text-align:center;margin-top:6px}
 .footer{text-align:center;font-size:.72rem;color:var(--doux);opacity:.5;font-weight:600}
+.lot-prenom-row{display:flex;align-items:center;gap:8px}
+.lot-prenom-row .champ{flex:1;margin-bottom:0}
+.lot-item{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-radius:10px;background:var(--gris);font-size:.85rem;font-weight:700}
+.lot-item.ok{border-left:4px solid var(--vert)}
+.lot-item.err{border-left:4px solid var(--rouge);color:var(--rouge)}
 .version-badge{display:inline-block;margin-top:6px;font-size:.7rem;font-weight:800;color:var(--doux);opacity:.5;background:rgba(108,60,225,.08);padding:2px 10px;border-radius:20px;letter-spacing:.5px}
 </style>
 </head>
@@ -592,13 +894,15 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
     <div class="badge">EnfantProdige</div>
     <h1 class="titre">BD <span>Personnalisée</span></h1>
     <p class="sous-titre">BD personnalisée = PDF prêt à envoyer ✨</p>
-    <div class="version-badge">v15/05/2026 08:40</div>
+    <div class="version-badge">v23/05/2026</div>
   </div>
 
   <!-- Onglets -->
   <div class="onglets">
-    <button class="onglet actif" onclick="changerOnglet('perso',this)">🎨 Personnaliser</button>
-    <button class="onglet" onclick="changerOnglet('biblio',this)">📚 Bibliothèque</button>
+    <button class="onglet actif" onclick="changerOnglet('perso',this)">🎨 Perso</button>
+    <button class="onglet" onclick="changerOnglet('lot',this)">📋 Lot</button>
+    <button class="onglet" onclick="changerOnglet('biblio',this)">📚 Biblio</button>
+    <button class="onglet" onclick="changerOnglet('historique',this)">📊 Stats</button>
   </div>
 
   <!-- ═══ ONGLET PERSONNALISER ═══ -->
@@ -647,7 +951,76 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
     <div class="res-taille" id="res-taille"></div>
     <br>
     <a href="#" class="btn-dl" id="btn-dl" download>⬇️ Télécharger le PDF</a>
+    <!-- P3 : Prévisualisation -->
+    <div id="preview-section" style="display:none;margin-top:14px">
+      <img id="preview-img" style="width:100%;border-radius:12px;box-shadow:0 4px 16px rgba(0,0,0,.10)" alt="Aperçu page 1">
+      <div style="font-size:.72rem;color:var(--doux);text-align:center;margin-top:5px">📄 Aperçu — page 1</div>
+    </div>
     <button class="btn-nouveau" onclick="nouveau()">Personnaliser une autre BD</button>
+  </div>
+
+  <!-- ═══ ONGLET LOT ═══ -->
+  <div class="carte" style="display:none" id="carte-lot">
+
+    <label class="label">Choisir la BD</label>
+    <select class="select-bd" id="lot-select-bd">
+      <option value="">— Sélectionner une BD —</option>
+    </select>
+
+    <label class="label">Prénoms à personnaliser</label>
+    <div id="lot-prenoms-list" style="display:flex;flex-direction:column;gap:8px;margin-bottom:10px">
+      <div class="lot-prenom-row" id="lot-row-0">
+        <input type="text" class="champ" placeholder="Ex : AMINATA" autocomplete="off"
+          style="margin-bottom:0" oninput="lotMajApercu()">
+        <button onclick="lotSupprimerLigne(this)" style="background:none;border:none;color:var(--rouge);font-size:1.2rem;cursor:pointer;padding:0 6px;flex-shrink:0">✕</button>
+      </div>
+    </div>
+    <button onclick="lotAjouterLigne()"
+      style="width:100%;padding:9px;border-radius:10px;border:2px dashed rgba(108,60,225,.25);background:none;color:var(--violet);font-family:'Nunito',sans-serif;font-size:.88rem;font-weight:800;cursor:pointer;margin-bottom:14px">
+      ＋ Ajouter un prénom
+    </button>
+
+    <label class="label">Compression</label>
+    <div class="comp-row" id="lot-comp-row">
+      <button class="comp-btn" onclick="setLotComp('aucune',this)">📄 Aucune</button>
+      <button class="comp-btn actif" onclick="setLotComp('moyenne',this)">⚖️ Moyenne</button>
+      <button class="comp-btn" onclick="setLotComp('forte',this)">🗜️ Forte</button>
+    </div>
+
+    <button class="btn" id="btn-lot" onclick="lancerLot()" style="margin-top:6px">
+      🚀 Générer le lot
+    </button>
+
+    <!-- Progression lot -->
+    <div class="loader" id="lot-loader" style="margin-top:14px">
+      <div class="gen-progress-wrap">
+        <div class="gen-progress-bar" id="lot-bar"></div>
+      </div>
+      <div class="gen-pct" id="lot-pct">0%</div>
+      <div class="gen-msg" id="lot-msg">En attente…</div>
+    </div>
+    <div class="msg err" id="lot-err"></div>
+
+    <!-- Résultats lot -->
+    <div id="lot-resultats" style="display:none;margin-top:16px">
+      <div class="sep"></div>
+      <label class="label">Résultats</label>
+
+      <!-- Téléchargement ZIP -->
+      <div id="lot-zip-section" style="display:none;margin-bottom:14px">
+        <a href="#" class="btn-dl" id="lot-btn-zip" download
+          style="display:flex;justify-content:center;gap:8px;padding:13px;text-decoration:none">
+          📦 Télécharger le ZIP (tous les PDFs)
+        </a>
+      </div>
+
+      <!-- Liste individuelle -->
+      <div id="lot-liste-individuelle" style="display:flex;flex-direction:column;gap:8px"></div>
+
+      <button class="btn-nouveau" onclick="lotReset()" style="margin-top:12px">
+        Nouveau lot
+      </button>
+    </div>
   </div>
 
   <!-- ═══ ONGLET BIBLIOTHÈQUE ═══ -->
@@ -702,6 +1075,36 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
     </div>
   </div>
 
+  <!-- ═══ ONGLET HISTORIQUE / STATS ═══ -->
+  <div class="carte" style="display:none" id="carte-historique">
+
+    <!-- P5 : Stats -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:18px" id="stats-grid">
+      <div style="background:var(--gris);border-radius:12px;padding:14px;text-align:center">
+        <div style="font-family:'Fredoka One',cursive;font-size:2rem;color:var(--violet)" id="stat-total">—</div>
+        <div style="font-size:.68rem;font-weight:800;text-transform:uppercase;letter-spacing:1px;color:var(--doux)">BDs générées</div>
+      </div>
+      <div style="background:var(--gris);border-radius:12px;padding:14px;text-align:center">
+        <div style="font-family:'Fredoka One',cursive;font-size:1.5rem;color:var(--orange);word-break:break-word" id="stat-prenom">—</div>
+        <div style="font-size:.68rem;font-weight:800;text-transform:uppercase;letter-spacing:1px;color:var(--doux)">Prénom ⭐</div>
+      </div>
+      <div style="background:var(--gris);border-radius:12px;padding:14px;text-align:center">
+        <div style="font-family:'Fredoka One',cursive;font-size:1.5rem;color:var(--vert)" id="stat-bd" title="">—</div>
+        <div style="font-size:.68rem;font-weight:800;text-transform:uppercase;letter-spacing:1px;color:var(--doux)">BD populaire</div>
+      </div>
+      <div style="background:var(--gris);border-radius:12px;padding:14px;text-align:center">
+        <div style="font-family:'Fredoka One',cursive;font-size:2rem;color:var(--rouge)" id="stat-today">—</div>
+        <div style="font-size:.68rem;font-weight:800;text-transform:uppercase;letter-spacing:1px;color:var(--doux)">Aujourd'hui</div>
+      </div>
+    </div>
+
+    <label class="label">Dernières générations</label>
+    <div id="historique-liste" style="display:flex;flex-direction:column;gap:7px;max-height:380px;overflow-y:auto">
+      <div class="liste-vide">Chargement…</div>
+    </div>
+    <button onclick="chargerHistorique()" style="margin-top:12px;width:100%;padding:9px;border-radius:10px;border:2px solid rgba(108,60,225,.15);background:none;color:var(--doux);font-family:'Nunito',sans-serif;font-size:.82rem;font-weight:800;cursor:pointer">🔄 Actualiser</button>
+  </div>
+
   <div class="footer">EnfantProdige · Académie des Génies · Yaoundé</div>
 </div>
 
@@ -712,9 +1115,54 @@ let compression = 'moyenne';
 function changerOnglet(id, btn) {
   document.querySelectorAll('.onglet').forEach(b => b.classList.remove('actif'));
   btn.classList.add('actif');
-  document.getElementById('carte-perso').style.display  = id === 'perso'  ? 'block' : 'none';
-  document.getElementById('carte-biblio').style.display = id === 'biblio' ? 'block' : 'none';
-  if (id === 'biblio') chargerListe();
+  document.getElementById('carte-perso').style.display      = id === 'perso'      ? 'block' : 'none';
+  document.getElementById('carte-lot').style.display        = id === 'lot'        ? 'block' : 'none';
+  document.getElementById('carte-biblio').style.display     = id === 'biblio'     ? 'block' : 'none';
+  document.getElementById('carte-historique').style.display = id === 'historique' ? 'block' : 'none';
+  if (id === 'biblio')     chargerListe();
+  if (id === 'lot')        chargerLotSelectBD();
+  if (id === 'historique') { chargerStats(); chargerHistorique(); }
+}
+
+// ── P4/P5 : Historique & Stats ────────────────────────────────────────────────
+async function chargerStats() {
+  try {
+    const d = await fetch('/api/stats').then(r => r.json());
+    document.getElementById('stat-total').textContent  = d.total ?? '—';
+    document.getElementById('stat-prenom').textContent = d.top_prenom || '—';
+    const bdEl = document.getElementById('stat-bd');
+    bdEl.textContent  = d.top_bd ? d.top_bd.substring(0,18) + (d.top_bd.length>18?'…':'') : '—';
+    bdEl.title        = d.top_bd || '';
+    // Aujourd'hui
+    const auj = (d.prenoms ? Object.values(d.prenoms) : []).reduce((a,b) => a+b, 0);
+    document.getElementById('stat-today').textContent = d.succes ?? '—';
+  } catch(e) { console.warn('stats erreur', e); }
+}
+
+async function chargerHistorique() {
+  const el = document.getElementById('historique-liste');
+  el.innerHTML = '<div class="liste-vide">Chargement…</div>';
+  try {
+    const d = await fetch('/api/historique').then(r => r.json());
+    if (d.message) { el.innerHTML = '<div class="liste-vide">' + d.message + '</div>'; return; }
+    const rows = d.commandes || [];
+    if (!rows.length) { el.innerHTML = '<div class="liste-vide">Aucune génération pour l\\'instant</div>'; return; }
+    el.innerHTML = rows.map(r => {
+      const date = r.created_at ? new Date(r.created_at).toLocaleString('fr-FR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}) : '';
+      const badge = r.statut === 'pret' ? '<span style="color:var(--vert)">✅</span>' : r.statut === 'erreur' ? '<span style="color:var(--rouge)">❌</span>' : '<span style="color:var(--doux)">⏳</span>';
+      const dl    = r.fichier && r.statut === 'pret' ? \`<a href="/telecharger/\${r.fichier}" download style="font-size:.72rem;font-weight:800;color:var(--violet);text-decoration:none">⬇️</a>\` : '';
+      return \`<div style="display:flex;align-items:center;justify-content:space-between;padding:9px 12px;border-radius:10px;background:var(--gris);gap:8px">
+        <div style="min-width:0">
+          <div style="font-weight:800;font-size:.85rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">\${badge} \${r.prenom}</div>
+          <div style="font-size:.7rem;color:var(--doux);\${r.bd_nom?'':'display:none'}">\${r.bd_nom||''} · \${date}</div>
+        </div>
+        <div style="flex-shrink:0;display:flex;gap:8px;align-items:center">
+          \${r.taille_mo ? '<span style="font-size:.7rem;font-weight:800;color:var(--doux)">'+r.taille_mo+'Mo</span>' : ''}
+          \${dl}
+        </div>
+      </div>\`;
+    }).join('');
+  } catch(e) { el.innerHTML = '<div class="liste-vide">Erreur de chargement</div>'; }
 }
 
 // ── Compression ───────────────────────────────────────────────────────────────
@@ -957,6 +1405,12 @@ async function generer() {
               document.getElementById('res-taille').textContent = '📦 ' + evt.taille_mo + ' Mo';
               document.getElementById('btn-dl').href = '/telecharger/' + evt.fichier;
               document.getElementById('btn-dl').download = 'BD_' + prenom_cap + '.pdf';
+              // P3 : prévisualisation page 1
+              const prevImg = document.getElementById('preview-img');
+              const prevSec = document.getElementById('preview-section');
+              prevImg.onload  = () => prevSec.style.display = 'block';
+              prevImg.onerror = () => prevSec.style.display = 'none';
+              prevImg.src = '/preview/' + evt.fichier;
               // Masquer le formulaire, afficher le résultat
               document.getElementById('carte-perso').style.display = 'none';
               document.getElementById('resultat').classList.add('actif');
@@ -995,6 +1449,168 @@ function affMsg(el, txt, cls) {
 
 // Init
 chargerSelectBD();
+chargerLotSelectBD();
+
+// ── Lot : gestion prénoms ─────────────────────────────────────────────────
+let lotCompression = 'moyenne';
+let lotRowCount    = 1;
+
+function setLotComp(val, btn) {
+  lotCompression = val;
+  document.querySelectorAll('#lot-comp-row .comp-btn').forEach(b => b.classList.remove('actif'));
+  btn.classList.add('actif');
+}
+
+function lotAjouterLigne() {
+  const list = document.getElementById('lot-prenoms-list');
+  const id   = lotRowCount++;
+  const div  = document.createElement('div');
+  div.className = 'lot-prenom-row';
+  div.id = 'lot-row-' + id;
+  div.innerHTML = `
+    <input type="text" class="champ" placeholder="Ex : KOFI" autocomplete="off"
+      style="margin-bottom:0">
+    <button onclick="lotSupprimerLigne(this)"
+      style="background:none;border:none;color:var(--rouge);font-size:1.2rem;cursor:pointer;padding:0 6px;flex-shrink:0">✕</button>
+  `;
+  list.appendChild(div);
+  div.querySelector('input').focus();
+}
+
+function lotSupprimerLigne(btn) {
+  const rows = document.querySelectorAll('.lot-prenom-row');
+  if (rows.length <= 1) return; // garder au moins 1
+  btn.closest('.lot-prenom-row').remove();
+}
+
+function lotGetPrenoms() {
+  return Array.from(document.querySelectorAll('#lot-prenoms-list input'))
+    .map(i => i.value.trim())
+    .filter(v => v.length > 0);
+}
+
+async function lancerLot() {
+  const bdId    = document.getElementById('lot-select-bd').value;
+  const prenoms = lotGetPrenoms();
+  const errEl   = document.getElementById('lot-err');
+  errEl.className = 'msg err';
+
+  if (!bdId)              { affMsg(errEl, 'Sélectionne une BD.', 'err'); return; }
+  if (prenoms.length < 1) { affMsg(errEl, 'Ajoute au moins un prénom.', 'err'); return; }
+
+  document.getElementById('btn-lot').disabled = true;
+  document.getElementById('lot-loader').classList.add('actif');
+  document.getElementById('lot-resultats').style.display = 'none';
+  document.getElementById('lot-liste-individuelle').innerHTML = '';
+  document.getElementById('lot-zip-section').style.display = 'none';
+
+  lotMajProgression(0, `Démarrage — ${prenoms.length} BD(s) à générer…`);
+
+  fetch('/generer-lot', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ bd_id: bdId, prenoms, compression: lotCompression })
+  }).then(response => {
+    const reader  = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    function lire() {
+      reader.read().then(({ done, value }) => {
+        if (done) { document.getElementById('btn-lot').disabled = false; return; }
+        buffer += decoder.decode(value, { stream: true });
+        const blocs = buffer.split('\n\n');
+        buffer = blocs.pop();
+
+        for (const bloc of blocs) {
+          if (!bloc.startsWith('data: ')) continue;
+          try {
+            const evt = JSON.parse(bloc.slice(6));
+            lotMajProgression(evt.pct, evt.msg);
+
+            if (evt.erreur && !evt.succes) {
+              affMsg(errEl, evt.erreur, 'err');
+              document.getElementById('btn-lot').disabled = false;
+              document.getElementById('lot-loader').classList.remove('actif');
+              return;
+            }
+
+            if (evt.succes) {
+              document.getElementById('lot-loader').classList.remove('actif');
+              afficherResultatsLot(evt);
+              document.getElementById('btn-lot').disabled = false;
+            }
+          } catch(e) {}
+        }
+        lire();
+      });
+    }
+    lire();
+  }).catch(e => {
+    affMsg(errEl, 'Erreur : ' + e.message, 'err');
+    document.getElementById('btn-lot').disabled = false;
+    document.getElementById('lot-loader').classList.remove('actif');
+  });
+}
+
+function lotMajProgression(pct, msg) {
+  document.getElementById('lot-bar').style.width = pct + '%';
+  document.getElementById('lot-pct').textContent = pct + '%';
+  document.getElementById('lot-msg').textContent  = msg;
+}
+
+function afficherResultatsLot(evt) {
+  document.getElementById('lot-resultats').style.display = 'block';
+
+  // ZIP
+  if (evt.zip) {
+    const zipEl = document.getElementById('lot-zip-section');
+    zipEl.style.display = 'block';
+    const btnZip = document.getElementById('lot-btn-zip');
+    btnZip.href     = '/telecharger/' + evt.zip;
+    btnZip.download = evt.zip;
+    btnZip.textContent = '📦 Télécharger le ZIP (' + evt.taille_zip + ' Mo — tous les PDFs)';
+  }
+
+  // Liste individuelle
+  const liste = document.getElementById('lot-liste-individuelle');
+  (evt.resultats || []).forEach(r => {
+    const div = document.createElement('div');
+    div.className = 'lot-item ' + (r.ok ? 'ok' : 'err');
+    if (r.ok) {
+      div.innerHTML = `
+        <span>✅ ${r.prenom} — ${r.taille_mo} Mo</span>
+        <a href="/telecharger/${r.fichier}" download="BD_${r.prenom}.pdf"
+           style="background:var(--vert);color:#fff;padding:5px 12px;border-radius:8px;text-decoration:none;font-size:.78rem;font-weight:800">
+           ⬇️ PDF
+        </a>`;
+    } else {
+      div.innerHTML = `<span>❌ ${r.prenom} : ${r.erreur}</span>`;
+    }
+    liste.appendChild(div);
+  });
+}
+
+function lotReset() {
+  document.getElementById('lot-resultats').style.display = 'none';
+  document.getElementById('lot-liste-individuelle').innerHTML = '';
+  document.getElementById('lot-zip-section').style.display = 'none';
+  document.getElementById('lot-err').className = 'msg err';
+  document.querySelectorAll('#lot-prenoms-list input').forEach(i => i.value = '');
+  lotMajProgression(0, 'En attente…');
+}
+
+async function chargerLotSelectBD() {
+  const res  = await fetch('/liste-bds');
+  const data = await res.json();
+  const sel  = document.getElementById('lot-select-bd');
+  sel.innerHTML = '<option value="">— Sélectionner une BD —</option>';
+  (data.bds || []).forEach(bd => {
+    const opt = document.createElement('option');
+    opt.value = bd.id; opt.textContent = bd.nom;
+    sel.appendChild(opt);
+  });
+}
 </script>
 </body>
 </html>"""
@@ -1031,15 +1647,20 @@ def ajouter_bd():
         except Exception as e:
             return jsonify({"erreur": f"Erreur téléchargement : {str(e)}"}), 400
 
-    meta = lire_meta()
-    meta[bd_id] = {
-        "id":       bd_id,
-        "nom":      nom,
-        "prenom":   prenom_bd,
-        "pages":    f"{bd_id}_bd.pdf",
-        "source":   lien_bd or "upload"
+    bd_entry = {
+        "id":        bd_id,
+        "nom":       nom,
+        "prenom":    prenom_bd,
+        "pages":     f"{bd_id}_bd.pdf",
+        "source":    "drive" if lien_bd else "upload",
+        "drive_url": lien_bd or "",
     }
+    meta = lire_meta()
+    meta[bd_id] = bd_entry
     ecrire_meta(meta)
+    # P1 : sync vers Supabase (async pour ne pas bloquer la réponse)
+    threading.Thread(target=ajouter_bd_supabase, args=(bd_entry,), daemon=True).start()
+    threading.Thread(target=_sb_upload_pdf, args=(bd_id, chemin_bd), daemon=True).start()
     return jsonify({"succes":True,"id":bd_id})
 
 @app.route("/liste-bds")
@@ -1063,13 +1684,15 @@ def supprimer_bd(bd_id):
     meta = lire_meta()
     if bd_id not in meta: return jsonify({"erreur":"BD introuvable"}), 404
     bd = meta[bd_id]
-    # Supprimer le fichier PDF
     nom_fichier = bd.get("pages") or bd.get("fichier", "")
     if nom_fichier:
         chemin = os.path.join(BIBLIO_FOLDER, nom_fichier)
         if os.path.exists(chemin): os.remove(chemin)
     del meta[bd_id]
     ecrire_meta(meta)
+    # P1 : supprimer de Supabase (async)
+    threading.Thread(target=supprimer_bd_supabase, args=(bd_id,), daemon=True).start()
+    threading.Thread(target=_sb_delete_pdf, args=(bd_id,), daemon=True).start()
     return jsonify({"succes":True})
 
 def _stream_generer(bd_id, prenom_nouveau, compression):
@@ -1087,11 +1710,13 @@ def _stream_generer(bd_id, prenom_nouveau, compression):
         return
 
     bd            = meta[bd_id]
-    nom_pages     = bd.get("pages") or bd.get("fichier","")
-    chemin_bd     = os.path.join(BIBLIO_FOLDER, nom_pages)
     prenom_ancien = bd["prenom"]
-    if not os.path.exists(chemin_bd):
-        yield evt(0, "Erreur", {"erreur": f"Fichier BD introuvable : {nom_pages}"})
+
+    # P1 : assurer que le PDF est disponible (download depuis Supabase/Drive si besoin)
+    yield evt(5, "📥 Vérification du fichier BD…")
+    chemin_bd = assurer_pdf_local(bd_id, bd)
+    if not chemin_bd:
+        yield evt(0, "Erreur", {"erreur": "Fichier BD introuvable. Vérifiez la connexion Supabase."})
         return
 
     docs_a_assembler = []
@@ -1122,12 +1747,22 @@ def _stream_generer(bd_id, prenom_nouveau, compression):
 
     yield evt(90, f"🗜️ Compression ({compression})…")
 
-    taille_mo = round(os.path.getsize(chemin_final) / (1024*1024), 1)
-    nb_pages  = len(fitz.open(chemin_final))
+    taille_mo   = round(os.path.getsize(chemin_final) / (1024*1024), 1)
+    nb_pages    = len(fitz.open(chemin_final))
+    nom_fichier = os.path.basename(chemin_final)
+
+    # P4 : enregistrer dans l'historique Supabase
+    threading.Thread(
+        target=_enregistrer_generation,
+        kwargs=dict(prenom=prenom_nouveau, bd_nom=bd["nom"], bd_id=bd_id,
+                    fichier=nom_fichier, taille_mo=taille_mo, nb_pages=nb_pages,
+                    source="manuel"),
+        daemon=True
+    ).start()
 
     yield evt(100, f"🎉 PDF prêt — {nb_pages} pages, {taille_mo} Mo", {
         "succes":          True,
-        "fichier":         os.path.basename(chemin_final),
+        "fichier":         nom_fichier,
         "taille_mo":       taille_mo,
         "pages":           nb_pages,
         "avec_couverture": bool(bd.get("couverture"))
@@ -1153,9 +1788,128 @@ def generer():
 
 @app.route("/telecharger/<nom>")
 def telecharger(nom):
+    nom    = os.path.basename(nom)  # sécurité : évite path traversal
     chemin = os.path.join(OUTPUT_FOLDER, nom)
     if not os.path.exists(chemin): return "Fichier introuvable", 404
     return send_file(chemin, as_attachment=True, download_name=nom)
+
+# ── P3 : Prévisualisation 1ère page ───────────────────────────────────────────
+@app.route("/preview/<nom>")
+def preview(nom):
+    nom    = os.path.basename(nom)
+    chemin = os.path.join(OUTPUT_FOLDER, nom)
+    if not os.path.exists(chemin): return "PDF introuvable", 404
+    try:
+        doc  = fitz.open(chemin)
+        pix  = doc[0].get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+        resp = make_response(pix.tobytes("png"))
+        resp.headers["Content-Type"]  = "image/png"
+        resp.headers["Cache-Control"] = "public, max-age=3600"
+        return resp
+    except Exception as e:
+        return f"Erreur preview : {e}", 500
+
+
+@app.route("/generer-lot", methods=["POST"])
+def generer_lot():
+    """
+    Génère plusieurs BDs personnalisées en une seule fois.
+    Body JSON : { bd_id, prenoms: ["EMMA", "AMINATA", ...], compression }
+    Retourne les résultats via SSE avec progression globale.
+    """
+    from flask import Response, stream_with_context
+    import json as _json, zipfile as _zip, io as _io
+
+    data        = request.json or {}
+    bd_id       = data.get("bd_id", "")
+    prenoms     = data.get("prenoms", [])
+    compression = data.get("compression", "moyenne")
+
+    def stream():
+        def evt(pct, msg, extra=None):
+            p = {"pct": pct, "msg": msg}
+            if extra: p.update(extra)
+            return "data: " + _json.dumps(p, ensure_ascii=False) + "\n\n"
+
+        meta = lire_meta()
+        if bd_id not in meta:
+            yield evt(0, "Erreur", {"erreur": "BD introuvable"})
+            return
+
+        bd            = meta[bd_id]
+        nom_pages     = bd.get("pages") or bd.get("fichier", "")
+        chemin_bd     = os.path.join(BIBLIO_FOLDER, nom_pages)
+        prenom_ancien = bd["prenom"]
+
+        if not os.path.exists(chemin_bd):
+            yield evt(0, "Erreur", {"erreur": "Fichier BD introuvable"})
+            return
+
+        total     = len(prenoms)
+        resultats = []  # { prenom, fichier, taille_mo, ok, erreur }
+
+        for i, prenom in enumerate(prenoms):
+            prenom = prenom.strip()
+            if not prenom:
+                continue
+
+            pct_base = int(i / total * 90)
+            yield evt(pct_base, f"[{i+1}/{total}] 📝 Génération de {prenom}…")
+
+            try:
+                doc_bd, nb = personnaliser_pdf_pages(chemin_bd, prenom_ancien, prenom)
+                if nb == 0:
+                    raise ValueError(f"'{prenom_ancien}' introuvable dans le PDF")
+
+                chemin_final = assembler_pdf([doc_bd], prenom, compression)
+                taille_mo    = round(os.path.getsize(chemin_final) / (1024*1024), 1)
+                nom_fichier  = os.path.basename(chemin_final)
+
+                resultats.append({
+                    "prenom":   prenom,
+                    "fichier":  nom_fichier,
+                    "taille_mo": taille_mo,
+                    "ok":       True
+                })
+                yield evt(pct_base + int(90/total), f"[{i+1}/{total}] ✅ {prenom} — {taille_mo} Mo")
+
+            except Exception as e:
+                resultats.append({
+                    "prenom": prenom,
+                    "ok":     False,
+                    "erreur": str(e)
+                })
+                yield evt(pct_base, f"[{i+1}/{total}] ❌ {prenom} : {str(e)[:60]}")
+
+        # ── Créer le ZIP ──────────────────────────────────────────────────
+        yield evt(92, "📦 Création du ZIP…")
+        try:
+            nom_zip    = f"BD_lot_{uuid.uuid4().hex[:6]}.zip"
+            chemin_zip = os.path.join(OUTPUT_FOLDER, nom_zip)
+
+            with _zip.ZipFile(chemin_zip, "w", _zip.ZIP_DEFLATED) as zf:
+                for r in resultats:
+                    if r["ok"]:
+                        chemin_pdf = os.path.join(OUTPUT_FOLDER, r["fichier"])
+                        if os.path.exists(chemin_pdf):
+                            zf.write(chemin_pdf, f"BD_{r['prenom']}.pdf")
+
+            taille_zip = round(os.path.getsize(chemin_zip) / (1024*1024), 1)
+            yield evt(100, f"🎉 Lot terminé — {len([r for r in resultats if r['ok']])}/{total} PDFs", {
+                "succes":    True,
+                "resultats": resultats,
+                "zip":       nom_zip,
+                "taille_zip": taille_zip
+            })
+
+        except Exception as e:
+            yield evt(95, "Erreur ZIP", {"erreur": str(e)})
+
+    return Response(
+        stream_with_context(stream()),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1176,7 +1930,9 @@ SMTP_USER     = os.environ.get("SMTP_USER", "")
 SMTP_PASSWORD = os.environ.get("SMTP_PASS", "")
 EMAIL_FROM    = os.environ.get("EMAIL_FROM", "")
 APP_URL       = os.environ.get("APP_URL", "https://bd-personnalisee.onrender.com")
-CHARIOW_SECRET = os.environ.get("CHARIOW_WEBHOOK_SECRET", "")
+CHARIOW_SECRET     = os.environ.get("CHARIOW_WEBHOOK_SECRET", "")
+ILOVEPDF_PUBLIC    = os.environ.get("ILOVEPDF_PUBLIC_KEY", "")
+ILOVEPDF_SECRET    = os.environ.get("ILOVEPDF_SECRET_KEY", "")
 
 # ── Clé de déduplication (évite les doublons en cas de retry Chariow) ────────
 _processed_sales = set()
@@ -1228,49 +1984,56 @@ Bonne lecture ! 🎉
 
 def traiter_commande(sale_id: str, prenom: str, email_client: str,
                      bd_id: str, compression: str = "moyenne"):
-    """
-    Traitement asynchrone : personnalise la BD et envoie l'email.
-    Appelé dans un thread séparé pour répondre 200 à Chariow immédiatement.
-    """
+    """Traitement asynchrone : personnalise la BD, envoie l'email, track le statut."""
     print(f"🔄 Traitement commande {sale_id} — prénom: {prenom} — BD: {bd_id}")
+    _cmd_set(sale_id, statut="en_cours", prenom=prenom)
 
     meta = lire_meta()
     if bd_id not in meta:
-        print(f"❌ BD introuvable : {bd_id}")
+        msg = f"BD introuvable : {bd_id}"
+        print(f"❌ {msg}")
+        _cmd_set(sale_id, statut="erreur", erreur=msg)
+        _mettre_a_jour_commande(sale_id, statut="erreur", erreur=msg)
         return
 
-    bd = meta[bd_id]
+    bd            = meta[bd_id]
     nom_bd        = bd["nom"]
-    nom_pages     = bd.get("pages") or bd.get("fichier", "")
-    chemin_bd     = os.path.join(BIBLIO_FOLDER, nom_pages)
     prenom_ancien = bd["prenom"]
-    if not os.path.exists(chemin_bd):
-        print(f"❌ Fichier BD introuvable : {chemin_bd}")
+
+    chemin_bd = assurer_pdf_local(bd_id, bd)
+    if not chemin_bd:
+        msg = "Fichier BD introuvable sur le serveur"
+        print(f"❌ {msg}")
+        _cmd_set(sale_id, statut="erreur", erreur=msg)
+        _mettre_a_jour_commande(sale_id, statut="erreur", erreur=msg)
         return
 
-    docs = []
-    # Pages BD
     try:
         doc_bd, nb = personnaliser_pdf_pages(chemin_bd, prenom_ancien, prenom)
-        docs.append(doc_bd)
         print(f"✅ {nb} remplacement(s) effectué(s)")
     except Exception as e:
         print(f"❌ Erreur BD : {e}")
+        _cmd_set(sale_id, statut="erreur", erreur=str(e))
+        _mettre_a_jour_commande(sale_id, statut="erreur", erreur=str(e))
         return
 
-    if not docs:
-        print("❌ Aucun document à assembler")
-        return
-
-    # Assemblage
     try:
-        chemin_final = assembler_pdf(docs, prenom, compression)
+        chemin_final = assembler_pdf([doc_bd], prenom, compression)
         print(f"✅ PDF généré : {chemin_final}")
     except Exception as e:
         print(f"❌ Erreur assemblage : {e}")
+        _cmd_set(sale_id, statut="erreur", erreur=str(e))
+        _mettre_a_jour_commande(sale_id, statut="erreur", erreur=str(e))
         return
 
-    # Envoi email
+    nom_fichier = os.path.basename(chemin_final)
+    taille_mo   = round(os.path.getsize(chemin_final) / (1024*1024), 1)
+    nb_pages    = len(fitz.open(chemin_final))
+
+    _cmd_set(sale_id, statut="pret", fichier=nom_fichier, taille_mo=taille_mo, nb_pages=nb_pages)
+    _mettre_a_jour_commande(sale_id, statut="pret", fichier=nom_fichier,
+                            taille_mo=taille_mo, nb_pages=nb_pages)
+
     envoyer_email_pdf(email_client, prenom, chemin_final, nom_bd)
 
 
@@ -1317,19 +2080,23 @@ def webhook_chariow():
     if not bd_id:
         return jsonify({"status": "erreur", "message": "bd_id manquant"}), 400
 
-    # ── 5. Lancer le traitement en arrière-plan ───────────────────────────────
-    thread = threading.Thread(
+    # ── 5. Enregistrer la commande (P2 / P4) et lancer en arrière-plan ──────────
+    meta   = lire_meta()
+    bd_nom = meta.get(bd_id, {}).get("nom", bd_id)
+    _enregistrer_commande_webhook(sale_id, prenom, email_client, bd_id, bd_nom)
+
+    threading.Thread(
         target=traiter_commande,
         args=(sale_id, prenom, email_client, bd_id, compression),
         daemon=True
-    )
-    thread.start()
+    ).start()
 
     return jsonify({
-        "status": "accepted",
-        "sale_id": sale_id,
-        "prenom": prenom,
-        "bd_id": bd_id
+        "status":   "accepted",
+        "sale_id":  sale_id,
+        "prenom":   prenom,
+        "bd_id":    bd_id,
+        "suivi":    f"{APP_URL}/commande/{sale_id}"
     }), 200
 
 
@@ -1432,5 +2199,214 @@ def api_liste_bds():
     ]
     return jsonify({"bds": bds}), 200
 
+# ══════════════════════════════════════════════════════════════════════════════
+# P2 — Page de confirmation commande
+# ══════════════════════════════════════════════════════════════════════════════
+
+HTML_COMMANDE = """<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Suivi commande — EnfantProdige</title>
+<link href="https://fonts.googleapis.com/css2?family=Fredoka+One&family=Nunito:wght@700;800&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Nunito',sans-serif;background:#F4F1FF;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.card{background:#fff;border-radius:24px;padding:36px 28px;max-width:460px;width:100%;text-align:center;box-shadow:0 8px 32px rgba(108,60,225,.12)}
+.logo{font-size:.8rem;font-weight:800;letter-spacing:2px;text-transform:uppercase;color:#6B5CA5;opacity:.5;margin-bottom:20px}
+.emoji{font-size:3.5rem;margin-bottom:12px}
+.titre{font-family:'Fredoka One',cursive;font-size:1.6rem;color:#1A1033;margin-bottom:8px}
+.sous{font-size:.9rem;color:#6B5CA5;font-weight:700;margin-bottom:24px}
+.barre-wrap{height:10px;background:rgba(108,60,225,.1);border-radius:10px;overflow:hidden;margin-bottom:10px}
+.barre{height:100%;background:linear-gradient(90deg,#6C3CE1,#06D6A0);width:30%;border-radius:10px;animation:pulse-bar 2s ease-in-out infinite}
+@keyframes pulse-bar{0%,100%{width:30%}50%{width:70%}}
+.msg{font-size:.85rem;font-weight:700;color:#6B5CA5;margin-bottom:24px;min-height:1.4em}
+.btn-dl{display:inline-flex;align-items:center;gap:8px;padding:14px 28px;border-radius:12px;background:#06D6A0;color:#fff;font-family:'Fredoka One',cursive;font-size:1.1rem;text-decoration:none;box-shadow:0 4px 0 rgba(6,214,160,.3);transition:transform .2s}
+.btn-dl:hover{transform:translateY(-2px)}
+.preview-wrap{margin-top:20px;display:none}
+.preview-wrap img{width:100%;border-radius:12px;box-shadow:0 4px 16px rgba(0,0,0,.1)}
+.preview-wrap small{font-size:.72rem;color:#6B5CA5;display:block;margin-top:6px}
+.err{background:rgba(255,77,109,.07);border:2px solid rgba(255,77,109,.2);border-radius:12px;padding:14px;color:#FF4D6D;font-weight:700;font-size:.85rem;display:none}
+.taille{display:inline-block;background:rgba(108,60,225,.08);color:#6C3CE1;font-size:.75rem;font-weight:800;padding:3px 10px;border-radius:8px;margin-top:8px;margin-bottom:16px}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">EnfantProdige</div>
+  <div class="emoji" id="emoji">⏳</div>
+  <h1 class="titre" id="titre">Génération en cours…</h1>
+  <p class="sous" id="sous">Ton PDF personnalisé est en préparation !</p>
+  <div class="barre-wrap" id="barre-wrap"><div class="barre" id="barre"></div></div>
+  <div class="msg" id="msg">Personnalisation du prénom…</div>
+  <div class="taille" id="taille" style="display:none"></div>
+  <a href="#" class="btn-dl" id="btn-dl" style="display:none">⬇️ Télécharger mon PDF</a>
+  <div class="preview-wrap" id="preview-wrap">
+    <img id="preview-img" alt="Aperçu page 1">
+    <small>📄 Aperçu page 1</small>
+  </div>
+  <div class="err" id="err"></div>
+</div>
+<script>
+const SALE_ID = "{{SALE_ID}}";
+const APP_URL = "{{APP_URL}}";
+let done = false;
+
+function poll() {
+  const es = new EventSource(APP_URL + '/api/commande/' + SALE_ID + '/status');
+  es.onmessage = function(e) {
+    const d = JSON.parse(e.data);
+    if (d.statut === 'pret') {
+      es.close(); done = true;
+      document.getElementById('emoji').textContent  = '🎉';
+      document.getElementById('titre').textContent  = 'PDF prêt !';
+      document.getElementById('sous').textContent   = 'Ton BD personnalisée t\\'attend !';
+      document.getElementById('barre-wrap').style.display = 'none';
+      document.getElementById('msg').style.display  = 'none';
+      if (d.taille_mo) {
+        const t = document.getElementById('taille');
+        t.textContent = '📦 ' + d.taille_mo + ' Mo · ' + (d.nb_pages || '') + ' pages';
+        t.style.display = 'inline-block';
+      }
+      const btn = document.getElementById('btn-dl');
+      btn.href = APP_URL + '/telecharger/' + d.fichier;
+      btn.download = 'BD_personnalisee.pdf';
+      btn.style.display = 'inline-flex';
+      const img = document.getElementById('preview-img');
+      const pw  = document.getElementById('preview-wrap');
+      img.onload  = () => pw.style.display = 'block';
+      img.onerror = () => pw.style.display = 'none';
+      img.src = APP_URL + '/preview/' + d.fichier;
+    } else if (d.statut === 'erreur') {
+      es.close(); done = true;
+      document.getElementById('emoji').textContent = '❌';
+      document.getElementById('titre').textContent = 'Une erreur est survenue';
+      document.getElementById('barre-wrap').style.display = 'none';
+      document.getElementById('msg').style.display  = 'none';
+      const err = document.getElementById('err');
+      err.textContent = d.erreur || 'Erreur inconnue. Contacte le support.';
+      err.style.display = 'block';
+    }
+  };
+  es.onerror = function() {
+    if (!done) setTimeout(poll, 5000); // retry
+    es.close();
+  };
+}
+poll();
+</script>
+</body>
+</html>"""
+
+@app.route("/commande/<sale_id>")
+def page_commande(sale_id):
+    """P2 — Page de confirmation de commande avec suivi en temps réel."""
+    html = HTML_COMMANDE.replace("{{SALE_ID}}", sale_id).replace("{{APP_URL}}", APP_URL)
+    return html
+
+@app.route("/api/commande/<sale_id>/status")
+def commande_status(sale_id):
+    """P2 — SSE : renvoie le statut d'une commande Chariow."""
+    import time as _time, json as _json
+
+    def stream():
+        start    = _time.time()
+        max_wait = 600  # 10 min max
+        last     = None
+        while _time.time() - start < max_wait:
+            # 1. Mémoire vive (thread en cours)
+            etat = _cmd_get(sale_id)
+            # 2. Supabase si pas encore en mémoire
+            if not etat and _sb_ok():
+                try:
+                    rows = _sb_req("GET",
+                        f"/rest/v1/bd_commandes?sale_id=eq.{sale_id}&select=*&limit=1",
+                        content_type=None)
+                    if isinstance(rows, list) and rows:
+                        r    = rows[0]
+                        etat = {"statut": r.get("statut", "en_cours"),
+                                "fichier": r.get("fichier", ""),
+                                "taille_mo": r.get("taille_mo"),
+                                "nb_pages":  r.get("nb_pages"),
+                                "erreur":    r.get("erreur", "")}
+                except Exception:
+                    pass
+
+            statut = etat.get("statut", "en_cours") if etat else "en_cours"
+            if statut != last:
+                last = statut
+                payload = {"statut": statut}
+                if statut == "pret":
+                    payload.update({
+                        "fichier":    etat.get("fichier", ""),
+                        "taille_mo":  etat.get("taille_mo"),
+                        "nb_pages":   etat.get("nb_pages"),
+                    })
+                elif statut == "erreur":
+                    payload["erreur"] = etat.get("erreur", "Erreur inconnue")
+                yield "data: " + _json.dumps(payload) + "\n\n"
+                if statut in ("pret", "erreur"):
+                    return
+            _time.sleep(3)
+
+    return Response(stream_with_context(stream()), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+# ══════════════════════════════════════════════════════════════════════════════
+# P4 — Historique des commandes
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/historique")
+def api_historique():
+    if not _sb_ok():
+        return jsonify({"commandes": [], "message": "Supabase non configuré"}), 200
+    try:
+        rows = _sb_req("GET",
+            "/rest/v1/bd_commandes?select=*&order=created_at.desc&limit=100",
+            content_type=None)
+        return jsonify({"commandes": rows if isinstance(rows, list) else []}), 200
+    except Exception as e:
+        return jsonify({"erreur": str(e)}), 500
+
+# ══════════════════════════════════════════════════════════════════════════════
+# P5 — Statistiques
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/stats")
+def api_stats():
+    if not _sb_ok():
+        return jsonify({"total": 0, "message": "Supabase non configuré"}), 200
+    try:
+        rows = _sb_req("GET",
+            "/rest/v1/bd_commandes?select=prenom,bd_nom,created_at,statut,source",
+            content_type=None)
+        if not isinstance(rows, list): rows = []
+        total   = len(rows)
+        succes  = sum(1 for r in rows if r.get("statut") == "pret")
+        prenoms = {}
+        bds     = {}
+        for r in rows:
+            p = r.get("prenom", "")
+            if p: prenoms[p] = prenoms.get(p, 0) + 1
+            b = r.get("bd_nom", "")
+            if b: bds[b] = bds.get(b, 0) + 1
+        top_prenom = max(prenoms, key=prenoms.get) if prenoms else ""
+        top_bd     = max(bds, key=bds.get)         if bds     else ""
+        return jsonify({
+            "total":            total,
+            "succes":           succes,
+            "top_prenom":       top_prenom,
+            "top_prenom_count": prenoms.get(top_prenom, 0),
+            "top_bd":           top_bd,
+            "top_bd_count":     bds.get(top_bd, 0),
+            "prenoms":          dict(sorted(prenoms.items(), key=lambda x: -x[1])[:10]),
+        }), 200
+    except Exception as e:
+        return jsonify({"erreur": str(e)}), 500
+
+
 if __name__ == "__main__":
+    try: sync_depuis_supabase()
+    except Exception: pass
+    try: initialiser_bds_defaut()
+    except Exception: pass
     app.run(debug=True, port=5000)
