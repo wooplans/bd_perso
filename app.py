@@ -1,11 +1,12 @@
 from flask import Flask, request, jsonify, send_file, Response, stream_with_context, make_response
 import fitz
-import re, os, uuid, json, glob, tempfile, threading, time
+import re, os, uuid, json, glob, tempfile, threading, time, unicodedata
 import urllib.request, urllib.error
 from functools import lru_cache
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50 MB upload limit
+_MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "200"))
+app.config['MAX_CONTENT_LENGTH'] = _MAX_UPLOAD_MB * 1024 * 1024
 
 BIBLIO_FOLDER = "./bibliotheque"
 
@@ -768,12 +769,15 @@ def assembler_pdf(docs, prenom, compression):
 
 
 def valider_prenom(p: str):
-    """Retourne le prénom nettoyé ou None si invalide."""
+    """Retourne le prénom nettoyé ou None si invalide.
+    Autorise toutes les lettres Unicode (accents inclus), espaces, tirets, apostrophes.
+    """
     p = p.strip()
     if len(p) < 2 or len(p) > 30:
         return None
-    if not re.match(r"^[\w\s'\-]+$", p, re.UNICODE):
-        return None
+    for c in p:
+        if not (unicodedata.category(c).startswith('L') or c in " -'"):
+            return None
     return p
 
 
