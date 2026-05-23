@@ -1,9 +1,11 @@
 from flask import Flask, request, jsonify, send_file, Response, stream_with_context, make_response
 import fitz
-import re, os, uuid, json, glob, tempfile, threading
+import re, os, uuid, json, glob, tempfile, threading, time
 import urllib.request, urllib.error
+from functools import lru_cache
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50 MB upload limit
 
 BIBLIO_FOLDER = "./bibliotheque"
 
@@ -524,11 +526,8 @@ def zone_effacement(page, span, police, taille):
         return fitz.Rect(orig[0]-5, orig[1]-asc, orig[0]+w+5, orig[1]+desc)
 
 
-def mesurer_texte(texte, fontfile, fontsize):
-    """
-    Mesure la bbox exacte d'un texte rendu avec une police et taille données.
-    Retourne (largeur, ascendant, descendant) en pixels.
-    """
+@lru_cache(maxsize=512)
+def _mesurer_texte_cached(texte: str, fontfile: str, fontsize: float):
     try:
         doc_tmp = fitz.open()
         page_tmp = doc_tmp.new_page(width=2000, height=300)
@@ -550,91 +549,95 @@ def mesurer_texte(texte, fontfile, fontsize):
         pass
     return len(texte) * fontsize * 0.6, fontsize * 0.75, fontsize * 0.2
 
+def mesurer_texte(texte, fontfile, fontsize):
+    if fontfile:
+        return _mesurer_texte_cached(texte, fontfile, round(fontsize, 1))
+    return len(texte) * fontsize * 0.6, fontsize * 0.75, fontsize * 0.2
+
 def largeur_texte(texte, fontfile, fontsize):
-    """Wrapper — retourne uniquement la largeur."""
     return mesurer_texte(texte, fontfile, fontsize)[0]
 
 def personnaliser_pdf_pages(chemin_pdf, prenom_ancien, prenom_nouveau):
     doc = fitz.open(chemin_pdf)
     cache_polices = extraire_polices_pdf(doc)
     total = 0
+    try:
+        for page in doc:
 
-    for page in doc:
+            # ── Collecter les LIGNES contenant le prénom ──────────────────────
+            lignes_a_reecrire = []
+            for bloc in page.get_text("dict")["blocks"]:
+                if bloc["type"] != 0: continue
+                for line in bloc["lines"]:
+                    if not any(prenom_ancien.upper() in span["text"].upper()
+                               for span in line["spans"]):
+                        continue
+                    centre, centre_x = est_bloc_centre(bloc, page.rect.width)
+                    lignes_a_reecrire.append({
+                        "spans":    line["spans"],
+                        "centre":   centre,
+                        "centre_x": centre_x,
+                    })
 
-        # ── Collecter les LIGNES contenant le prénom ──────────────────────
-        lignes_a_reecrire = []
-        for bloc in page.get_text("dict")["blocks"]:
-            if bloc["type"] != 0: continue
-            for line in bloc["lines"]:
-                if not any(prenom_ancien.upper() in span["text"].upper()
-                           for span in line["spans"]):
-                    continue
-                centre, centre_x = est_bloc_centre(bloc, page.rect.width)
-                lignes_a_reecrire.append({
-                    "spans":    line["spans"],
-                    "centre":   centre,
-                    "centre_x": centre_x,
-                })
+            # ── Étape 1 : effacer tous les spans des lignes ciblées ───────────
+            for info in lignes_a_reecrire:
+                for span in info["spans"]:
+                    police_span = police_pour_span(span, cache_polices)
+                    zone = zone_effacement(page, span, police_span, span["size"])
+                    page.add_redact_annot(zone, fill=(1, 1, 1))
+            page.apply_redactions()
 
-        # ── Étape 1 : effacer tous les spans des lignes ciblées ───────────
-        for info in lignes_a_reecrire:
-            for span in info["spans"]:
-                police_span = police_pour_span(span, cache_polices)
-                zone = zone_effacement(page, span, police_span, span["size"])
-                page.add_redact_annot(zone, fill=(1, 1, 1))
-        page.apply_redactions()
+            # ── Étape 2 : réécrire chaque ligne en recalculant les positions ──
+            for info in lignes_a_reecrire:
+                spans     = info["spans"]
+                prenom_up = prenom_ancien.upper()
 
-        # ── Étape 2 : réécrire chaque ligne en recalculant les positions ──
-        for info in lignes_a_reecrire:
-            spans     = info["spans"]
-            prenom_up = prenom_ancien.upper()
+                delta_x = 0.0
+                for span in spans:
+                    if prenom_up in span["text"].upper():
+                        police  = police_pour_span(span, cache_polices)
+                        taille  = span["size"]
+                        texte_n = adapter_casse(prenom_nouveau, span["text"], prenom_ancien)
+                        w_ancien, _, _ = mesurer_texte(span["text"], police, taille)
+                        w_nouveau, _, _ = mesurer_texte(texte_n, police, taille)
+                        delta_x = w_nouveau - w_ancien
+                        break
 
-            # Calculer le delta_x : différence de largeur entre ancien et nouveau prénom
-            delta_x = 0.0
-            for span in spans:
-                if prenom_up in span["text"].upper():
-                    police  = police_pour_span(span, cache_polices)
-                    taille  = span["size"]
-                    texte_n = adapter_casse(prenom_nouveau, span["text"], prenom_ancien)
-                    w_ancien, _, _ = mesurer_texte(span["text"], police, taille)
-                    w_nouveau, _, _ = mesurer_texte(texte_n, police, taille)
-                    delta_x = w_nouveau - w_ancien
-                    break
+                prenom_vu = False
+                for span in spans:
+                    texte_nouveau = adapter_casse(prenom_nouveau, span["text"], prenom_ancien)
+                    police     = police_pour_span(span, cache_polices)
+                    taille     = span["size"]
+                    baseline_y = span["origin"][1]
+                    contient   = prenom_up in span["text"].upper()
 
-            # Réécrire chaque span
-            prenom_vu = False
-            for span in spans:
-                texte_nouveau = adapter_casse(prenom_nouveau, span["text"], prenom_ancien)
-                police     = police_pour_span(span, cache_polices)
-                taille     = span["size"]
-                baseline_y = span["origin"][1]
-                contient   = prenom_up in span["text"].upper()
+                    if info["centre"] and contient:
+                        w_n, _, _ = mesurer_texte(texte_nouveau, police, taille)
+                        x_depart = info["centre_x"] - w_n / 2
+                    elif contient:
+                        x_depart = span["origin"][0]
+                        prenom_vu = True
+                    elif prenom_vu and delta_x != 0.0:
+                        x_depart = span["origin"][0] + delta_x
+                    else:
+                        x_depart = span["origin"][0]
 
-                if info["centre"] and contient:
-                    # Centré : recalculer X depuis le centre de la page
-                    w_n, _, _ = mesurer_texte(texte_nouveau, police, taille)
-                    x_depart = info["centre_x"] - w_n / 2
-                elif contient:
-                    # Span du prénom : position X originale
-                    x_depart = span["origin"][0]
-                    prenom_vu = True
-                elif prenom_vu and delta_x != 0.0:
-                    # Span APRÈS le prénom : décaler du delta
-                    x_depart = span["origin"][0] + delta_x
-                else:
-                    # Span AVANT le prénom : position inchangée
-                    x_depart = span["origin"][0]
+                    page.insert_text(
+                        (x_depart, baseline_y),
+                        texte_nouveau,
+                        fontfile=police,
+                        fontsize=taille,
+                        color=(0, 0, 0)
+                    )
+                    total += 1
 
-                page.insert_text(
-                    (x_depart, baseline_y),
-                    texte_nouveau,
-                    fontfile=police,
-                    fontsize=taille,
-                    color=(0, 0, 0)
-                )
-                total += 1
-
-    return doc, total
+        return doc, total
+    finally:
+        for chemin_police in cache_polices.values():
+            try:
+                os.remove(chemin_police)
+            except OSError:
+                pass
 
 
 # ── Assemblage PDF final ───────────────────────────────────────────────────
@@ -763,6 +766,30 @@ def assembler_pdf(docs, prenom, compression):
 
     return chemin
 
+
+def valider_prenom(p: str):
+    """Retourne le prénom nettoyé ou None si invalide."""
+    p = p.strip()
+    if len(p) < 2 or len(p) > 30:
+        return None
+    if not re.match(r"^[\w\s'\-]+$", p, re.UNICODE):
+        return None
+    return p
+
+
+def nettoyer_anciens_pdfs(max_age_heures=48):
+    """Supprime les PDFs/ZIPs de /output plus vieux que max_age_heures."""
+    seuil = time.time() - max_age_heures * 3600
+    for pattern in [os.path.join(OUTPUT_FOLDER, "*.pdf"),
+                    os.path.join(OUTPUT_FOLDER, "*.zip")]:
+        for f in glob.glob(pattern):
+            if os.path.getmtime(f) < seuil:
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # HTML
 # ══════════════════════════════════════════════════════════════════════════════
@@ -775,6 +802,10 @@ try:
     initialiser_bds_defaut() # BDs par défaut si absentes
 except Exception as _e:
     print(f"⚠️  Init BDs par défaut : {_e}")
+try:
+    nettoyer_anciens_pdfs()  # Nettoyage /output au démarrage
+except Exception as _e:
+    print(f"⚠️  Nettoyage /output : {_e}")
 
 HTML = r"""<!DOCTYPE html>
 <html lang="fr">
@@ -1704,6 +1735,11 @@ def _stream_generer(bd_id, prenom_nouveau, compression):
         if data: payload.update(data)
         return "data: " + _json.dumps(payload, ensure_ascii=False) + "\n\n"
 
+    prenom_nouveau = valider_prenom(prenom_nouveau)
+    if not prenom_nouveau:
+        yield evt(0, "Erreur", {"erreur": "Prénom invalide (2–30 caractères, lettres/tirets/apostrophes uniquement)"})
+        return
+
     meta = lire_meta()
     if bd_id not in meta:
         yield evt(0, "Erreur", {"erreur": "BD introuvable"})
@@ -1837,12 +1873,11 @@ def generer_lot():
             return
 
         bd            = meta[bd_id]
-        nom_pages     = bd.get("pages") or bd.get("fichier", "")
-        chemin_bd     = os.path.join(BIBLIO_FOLDER, nom_pages)
         prenom_ancien = bd["prenom"]
 
-        if not os.path.exists(chemin_bd):
-            yield evt(0, "Erreur", {"erreur": "Fichier BD introuvable"})
+        chemin_bd = assurer_pdf_local(bd_id, bd)
+        if not chemin_bd:
+            yield evt(0, "Erreur", {"erreur": "Fichier BD introuvable. Vérifiez la connexion Supabase."})
             return
 
         total     = len(prenoms)
@@ -2071,12 +2106,13 @@ def webhook_chariow():
     custom_metadata = sale.get("custom_metadata") or {}
     all_custom = {**custom_metadata, **custom_fields}
 
-    prenom      = all_custom.get("prenom_enfant", "").strip()
-    bd_id       = all_custom.get("bd_id", "").strip()
-    compression = all_custom.get("compression", "moyenne").strip()
+    prenom_brut  = all_custom.get("prenom_enfant", "").strip()
+    bd_id        = all_custom.get("bd_id", "").strip()
+    compression  = all_custom.get("compression", "moyenne").strip()
 
+    prenom = valider_prenom(prenom_brut)
     if not prenom:
-        return jsonify({"status": "erreur", "message": "prenom_enfant manquant"}), 400
+        return jsonify({"status": "erreur", "message": "prenom_enfant manquant ou invalide"}), 400
     if not bd_id:
         return jsonify({"status": "erreur", "message": "bd_id manquant"}), 400
 
@@ -2119,14 +2155,14 @@ def api_generer_bd():
     data = request.get_json(silent=True) or {}
 
     bd_id       = data.get("bd_id", "").strip()
-    prenom      = data.get("prenom", "").strip()
+    prenom      = valider_prenom(data.get("prenom", ""))
     email       = data.get("email", "").strip()
     compression = data.get("compression", "moyenne").strip()
 
     if not bd_id:
         return jsonify({"erreur": "bd_id manquant"}), 400
     if not prenom:
-        return jsonify({"erreur": "prenom manquant"}), 400
+        return jsonify({"erreur": "prenom invalide (2–30 caractères, lettres/tirets/apostrophes)"}), 400
 
     meta = lire_meta()
     if bd_id not in meta:
@@ -2404,9 +2440,20 @@ def api_stats():
         return jsonify({"erreur": str(e)}), 500
 
 
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok", "supabase": _sb_ok()}), 200
+
+@app.errorhandler(413)
+def trop_grand(e):
+    return jsonify({"erreur": "Fichier trop volumineux (max 50 Mo)"}), 413
+
+
 if __name__ == "__main__":
     try: sync_depuis_supabase()
     except Exception: pass
     try: initialiser_bds_defaut()
+    except Exception: pass
+    try: nettoyer_anciens_pdfs()
     except Exception: pass
     app.run(debug=True, port=5000)
