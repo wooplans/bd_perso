@@ -1,6 +1,6 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, after_this_request
 import fitz
-import re, os, uuid, json, glob, tempfile
+import re, os, uuid, json, glob, tempfile, time, threading
 import urllib.request
 
 app = Flask(__name__)
@@ -59,6 +59,24 @@ META_FILE     = "./bibliotheque/meta.json"
 
 os.makedirs(BIBLIO_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+# Nettoyage au démarrage : vide les outputs d'un éventuel déploiement précédent
+for _f in glob.glob(os.path.join(OUTPUT_FOLDER, "*.pdf")):
+    try: os.remove(_f)
+    except: pass
+
+def _cleanup_output_loop():
+    """Supprime les fichiers output de plus de 30 min (filet de sécurité)."""
+    while True:
+        time.sleep(1800)
+        limite = time.time() - 1800
+        for _f in glob.glob(os.path.join(OUTPUT_FOLDER, "*.pdf")):
+            try:
+                if os.path.getmtime(_f) < limite:
+                    os.remove(_f)
+            except: pass
+
+threading.Thread(target=_cleanup_output_loop, daemon=True).start()
 
 # ── Police ─────────────────────────────────────────────────────────────────
 def _trouver_police():
@@ -1155,6 +1173,13 @@ def generer():
 def telecharger(nom):
     chemin = os.path.join(OUTPUT_FOLDER, nom)
     if not os.path.exists(chemin): return "Fichier introuvable", 404
+
+    @after_this_request
+    def _supprimer(response):
+        try: os.remove(chemin)
+        except: pass
+        return response
+
     return send_file(chemin, as_attachment=True, download_name=nom)
 
 
