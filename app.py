@@ -472,13 +472,17 @@ def aplatir_pdf(doc, dpi: int, qualite_jpeg: int) -> fitz.Document:
     mat      = fitz.Matrix(dpi / 72, dpi / 72)
     doc_flat = fitz.open()
 
-    for page in doc:
-        pix  = page.get_pixmap(matrix=mat, alpha=False)
-        img  = PILImage.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        buf  = _io.BytesIO()
-        img.save(buf, format="JPEG", quality=qualite_jpeg, optimize=True)
-        page_new = doc_flat.new_page(width=page.rect.width, height=page.rect.height)
-        page_new.insert_image(page_new.rect, stream=buf.getvalue())
+    for idx, page in enumerate(doc):
+        try:
+            pix      = page.get_pixmap(matrix=mat, alpha=False)
+            img      = PILImage.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            buf      = _io.BytesIO()
+            img.save(buf, format="JPEG", quality=qualite_jpeg, optimize=True)
+            page_new = doc_flat.new_page(width=page.rect.width, height=page.rect.height)
+            page_new.insert_image(page_new.rect, stream=buf.getvalue())
+        except Exception as e:
+            print(f"⚠️ Aplatissement page {idx} échoué ({e}) — copie brute")
+            doc_flat.insert_pdf(doc, from_page=idx, to_page=idx)
 
     return doc_flat
 
@@ -497,12 +501,12 @@ def assembler_pdf(docs, prenom, compression):
     chemin = os.path.join(OUTPUT_FOLDER, nom)
 
     if compression == "forte":
-        pdf_aplati = aplatir_pdf(pdf_final, dpi=150, qualite_jpeg=80)
+        pdf_aplati = aplatir_pdf(pdf_final, dpi=120, qualite_jpeg=72)
         pdf_final.close()
         pdf_aplati.save(chemin, garbage=4, deflate=True)
         pdf_aplati.close()
     elif compression == "moyenne":
-        pdf_final = compresser_images_pdf(pdf_final, qualite_jpeg=70, max_dim=1200)
+        pdf_final = compresser_images_pdf(pdf_final, qualite_jpeg=60, max_dim=800)
         pdf_final.save(chemin, garbage=4, deflate=True, clean=True)
         pdf_final.close()
     else:
