@@ -2,23 +2,75 @@ from flask import Flask, request, jsonify, send_file, after_this_request
 import fitz
 import re, os, uuid, json, glob, tempfile, time, threading
 import urllib.request
+import requests as _requests
 
 app = Flask(__name__)
 
 BIBLIO_FOLDER = "./bibliotheque"
+OUTPUT_FOLDER = "./output"
+
+os.makedirs(BIBLIO_FOLDER, exist_ok=True)
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+# ── Supabase ────────────────────────────────────────────────────────────────
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://xlmwzvkqjnoijdldzrol.supabase.co")
+SUPABASE_KEY = os.environ.get("SUPABASE_ANON_KEY",
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+    ".eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhsbXd6dmtxam5vaWpkbGR6cm9sIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQxMTAzMjAsImV4cCI6MjA4OTY4NjMyMH0"
+    ".cQcRRHaaMiht2Tq9CB9l4_XN8-SOjixxhHFJDjytze4")
+
+def _supa_headers():
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation"
+    }
+
+def lire_meta():
+    """Lit la bibliothèque depuis Supabase. Retourne {id: bd_dict}."""
+    try:
+        resp = _requests.get(
+            f"{SUPABASE_URL}/rest/v1/bd_bibliotheque?select=*&order=created_at",
+            headers=_supa_headers(), timeout=10
+        )
+        if resp.status_code == 200:
+            return {bd["id"]: bd for bd in resp.json()}
+    except Exception as e:
+        print(f"⚠️ Supabase lire_meta erreur: {e}")
+    return {}
+
+def ecrire_bd_supa(bd_id, data):
+    """Insère une nouvelle BD dans Supabase."""
+    try:
+        payload = {"id": bd_id, **data}
+        resp = _requests.post(
+            f"{SUPABASE_URL}/rest/v1/bd_bibliotheque",
+            headers=_supa_headers(), json=payload, timeout=10
+        )
+        if resp.status_code not in (200, 201):
+            print(f"⚠️ Supabase insert erreur {resp.status_code}: {resp.text}")
+    except Exception as e:
+        print(f"⚠️ Supabase ecrire erreur: {e}")
+
+def supprimer_bd_supa(bd_id):
+    """Supprime une BD de Supabase."""
+    try:
+        _requests.delete(
+            f"{SUPABASE_URL}/rest/v1/bd_bibliotheque?id=eq.{bd_id}",
+            headers=_supa_headers(), timeout=10
+        )
+    except Exception as e:
+        print(f"⚠️ Supabase supprimer erreur: {e}")
+
 
 def telecharger_drive(url: str, suffixe: str = ".pdf") -> str:
     """
     Télécharge un PDF depuis un lien Google Drive public.
-    Supporte les formats :
-      - https://drive.google.com/file/d/{ID}/view
-      - https://drive.google.com/open?id={ID}
-      - https://docs.google.com/...
     Retourne le chemin local du fichier téléchargé.
     """
-    import re as _re, urllib.request as _req, urllib.error
+    import re as _re, urllib.request as _req
 
-    # Extraire l'ID du fichier Drive
     patterns = [
         r"/file/d/([a-zA-Z0-9_-]+)",
         r"[?&]id=([a-zA-Z0-9_-]+)",
@@ -34,11 +86,8 @@ def telecharger_drive(url: str, suffixe: str = ".pdf") -> str:
     if not file_id:
         raise ValueError(f"Impossible d'extraire l'ID Google Drive depuis : {url}")
 
-    # URL de téléchargement direct
     download_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
-
     chemin = os.path.join(BIBLIO_FOLDER, f"drive_{uuid.uuid4().hex[:10]}{suffixe}")
-    os.makedirs(BIBLIO_FOLDER, exist_ok=True)
 
     headers = {"User-Agent": "Mozilla/5.0"}
     req = urllib.request.Request(download_url, headers=headers)
@@ -46,7 +95,6 @@ def telecharger_drive(url: str, suffixe: str = ".pdf") -> str:
         with open(chemin, "wb") as f:
             f.write(resp.read())
 
-    # Vérifier que c'est bien un PDF
     with open(chemin, "rb") as f:
         header = f.read(4)
     if header != b"%PDF":
@@ -54,19 +102,54 @@ def telecharger_drive(url: str, suffixe: str = ".pdf") -> str:
         raise ValueError("Le fichier téléchargé n'est pas un PDF valide. Vérifiez que le lien est public.")
 
     return chemin
-OUTPUT_FOLDER = "./output"
-META_FILE     = "./bibliotheque/meta.json"
 
-os.makedirs(BIBLIO_FOLDER, exist_ok=True)
-os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-# Nettoyage au démarrage : vide les outputs d'un éventuel déploiement précédent
+def _assurer_fichier_bd(bd):
+    """
+    S'assure que le fichier PDF de la BD existe localement.
+    Re-télécharge depuis Drive si manquant (par ex. après un redémarrage).
+    """
+    nom_pages = bd.get("pages") or bd.get("fichier", "")
+    if not nom_pages:
+        return None
+    chemin_bd = os.path.join(BIBLIO_FOLDER, nom_pages)
+
+    if os.path.exists(chemin_bd):
+        return chemin_bd
+
+    drive_url = bd.get("drive_url", "")
+    if not drive_url:
+        print(f"⚠️ Fichier manquant et pas de drive_url pour BD {bd.get('id')}")
+        return None
+
+    print(f"📥 Re-téléchargement BD {bd.get('id')} depuis Drive…")
+    try:
+        chemin_tmp = telecharger_drive(drive_url)
+        os.rename(chemin_tmp, chemin_bd)
+        print(f"✅ BD {bd.get('id')} récupérée → {chemin_bd}")
+        return chemin_bd
+    except Exception as e:
+        print(f"❌ Erreur re-téléchargement BD {bd.get('id')}: {e}")
+        return None
+
+
+# ── Pré-chargement au démarrage ─────────────────────────────────────────────
+def _precharger_bds():
+    """Télécharge en arrière-plan les BDs manquantes depuis Drive."""
+    time.sleep(3)  # laisser le serveur démarrer
+    meta = lire_meta()
+    for bd in meta.values():
+        _assurer_fichier_bd(bd)
+
+threading.Thread(target=_precharger_bds, daemon=True).start()
+
+
+# ── Nettoyage output ────────────────────────────────────────────────────────
 for _f in glob.glob(os.path.join(OUTPUT_FOLDER, "*.pdf")):
     try: os.remove(_f)
     except: pass
 
 def _cleanup_output_loop():
-    """Supprime les fichiers output de plus de 30 min (filet de sécurité)."""
     while True:
         time.sleep(1800)
         limite = time.time() - 1800
@@ -88,23 +171,14 @@ def _trouver_police():
         if os.path.exists(c): return c
     return None
 
-POLICE_FALLBACK = _trouver_police()  # Comic Neue en secours
+POLICE_FALLBACK = _trouver_police()
 
-# Dossier fonts dans le repo (polices complètes uploadées)
 FONTS_FOLDER = "./fonts"
 os.makedirs(FONTS_FOLDER, exist_ok=True)
 
 def trouver_police_repo(nom_span):
-    """
-    Cherche une police complète dans ./fonts/ ET à la racine du repo.
-    Correspondance souple sur le nom de fichier.
-    Ex: span "ComicSansMS" → trouve comic.ttf
-    """
     nom_lower = nom_span.lower().replace("-","").replace(" ","").replace("_","")
-
-    # Dossiers à chercher : racine du repo + sous-dossier fonts/
     dossiers = [".", FONTS_FOLDER]
-
     try:
         for dossier in dossiers:
             if not os.path.exists(dossier):
@@ -120,11 +194,6 @@ def trouver_police_repo(nom_span):
     return None
 
 def extraire_polices_pdf(doc):
-    """
-    Extrait les polices embarquées du PDF.
-    ⚠️ Canva sous-ensemblise les polices (glyphes limités).
-    Retourne un dict : { nom_normalisé → chemin_tmp }
-    """
     cache = {}
     try:
         fonts = doc.get_page_fonts(0, full=True)
@@ -146,36 +215,16 @@ def extraire_polices_pdf(doc):
     return cache
 
 def police_pour_span(span, cache_polices):
-    """
-    Priorité :
-    1. Police complète dans ./fonts/ du repo  ← idéal, glyphes complets
-    2. Police extraite du PDF                 ← glyphes limités (subset Canva)
-    3. Fallback Comic Neue
-    """
     nom_span = span["font"].lower()
-
-    # 1. Chercher dans ./fonts/ (police complète)
     police_repo = trouver_police_repo(nom_span)
     if police_repo:
         return police_repo
-
-    # 2. Police extraite du PDF (attention aux glyphes manquants)
     if nom_span in cache_polices:
         return cache_polices[nom_span]
     for nom_cache, chemin in cache_polices.items():
         if nom_span in nom_cache or nom_cache in nom_span:
             return chemin
-
-    # 3. Fallback
     return POLICE_FALLBACK
-
-# ── Méta bibliothèque ───────────────────────────────────────────────────────
-def lire_meta():
-    if not os.path.exists(META_FILE): return {}
-    with open(META_FILE) as f: return json.load(f)
-
-def ecrire_meta(meta):
-    with open(META_FILE, "w") as f: json.dump(meta, f, ensure_ascii=False, indent=2)
 
 # ── Personnalisation PDF ───────────────────────────────────────────────────
 def adapter_casse(prenom_nouveau, texte, prenom_ancien):
@@ -187,11 +236,6 @@ def adapter_casse(prenom_nouveau, texte, prenom_ancien):
     return re.compile(re.escape(prenom_ancien), re.IGNORECASE).sub(remplacer, texte)
 
 def est_bloc_centre(bloc, page_largeur=595.0, tol_multi=3.0, tol_page=5.0):
-    """
-    Détecte si un bloc Canva est centré. Deux cas :
-    1. Plusieurs lignes → toutes ont le même centre X (± tol_multi)
-    2. Une seule ligne  → son centre X ≈ centre de la page (± tol_page)
-    """
     centres = []
     for line in bloc["lines"]:
         for span in line["spans"]:
@@ -202,14 +246,12 @@ def est_bloc_centre(bloc, page_largeur=595.0, tol_multi=3.0, tol_page=5.0):
     if not centres:
         return False, 0
 
-    # ── Plusieurs lignes ──────────────────────────────────────────────────
     if len(centres) >= 2:
         ref = centres[0]
         if all(abs(c - ref) <= tol_multi for c in centres):
             return True, ref
         return False, 0
 
-    # ── Une seule ligne → centré sur la page ? ────────────────────────────
     centre_page = page_largeur / 2
     if abs(centres[0] - centre_page) <= tol_page:
         return True, centre_page
@@ -217,15 +259,6 @@ def est_bloc_centre(bloc, page_largeur=595.0, tol_multi=3.0, tol_page=5.0):
     return False, 0
 
 def zone_effacement(page, span, police, taille):
-    """
-    Détecte la zone blanche exacte d'un cartouche Canva autour d'un span.
-
-    Méthode :
-    - X : scanner juste sous la baseline (zone sans texte) pour trouver
-          le segment blanc qui contient le centre du span
-    - Y : scanner verticalement sur cette largeur pour trouver les bornes
-          hautes/basses de la zone blanche (rangées >50% blanches)
-    """
     try:
         import numpy as np, io
         from PIL import Image
@@ -235,16 +268,14 @@ def zone_effacement(page, span, police, taille):
         scale = 4.0
         centre_x = (bbox[0] + bbox[2]) / 2
 
-        # ── 1. Scan horizontal sous la baseline (zone sans lettres) ───────
-        y_scan = bbox[3] - 2  # juste sous le bas de la bbox
+        y_scan = bbox[3] - 2
         zone_h = fitz.Rect(0, y_scan - 0.5, page.rect.width, y_scan + 0.5)
         pix_h  = page.get_pixmap(matrix=mat, clip=zone_h)
         arr_h  = np.array(Image.open(io.BytesIO(pix_h.tobytes("png"))))
         masque_h = (arr_h[:,:,0]>240)&(arr_h[:,:,1]>240)&(arr_h[:,:,2]>240)
 
-        # Trouver le segment blanc qui contient le centre du span
         centre_col = int(centre_x * scale)
-        x0_pdf, x1_pdf = bbox[0] - 5, bbox[2] + 5  # fallback
+        x0_pdf, x1_pdf = bbox[0] - 5, bbox[2] + 5
         in_white, seg_start = False, 0
         for col_i in range(masque_h.shape[1]):
             is_w = masque_h[:, col_i].any()
@@ -260,7 +291,6 @@ def zone_effacement(page, span, police, taille):
             x0_pdf = seg_start       / scale
             x1_pdf = masque_h.shape[1] / scale
 
-        # ── 2. Scan vertical sur la largeur trouvée ────────────────────────
         marge_v = 30
         zone_v  = fitz.Rect(
             x0_pdf + 10, max(0, bbox[1] - marge_v),
@@ -289,10 +319,7 @@ def zone_effacement(page, span, police, taille):
 
 
 def mesurer_texte(texte, fontfile, fontsize):
-    """
-    Mesure la bbox exacte d'un texte rendu avec une police et taille données.
-    Retourne (largeur, ascendant, descendant) en pixels.
-    """
+    doc_tmp = None
     try:
         doc_tmp = fitz.open()
         page_tmp = doc_tmp.new_page(width=2000, height=300)
@@ -312,10 +339,12 @@ def mesurer_texte(texte, fontfile, fontsize):
                             return largeur, ascendant, descendant
     except Exception:
         pass
+    finally:
+        if doc_tmp:
+            doc_tmp.close()
     return len(texte) * fontsize * 0.6, fontsize * 0.75, fontsize * 0.2
 
 def largeur_texte(texte, fontfile, fontsize):
-    """Wrapper — retourne uniquement la largeur."""
     return mesurer_texte(texte, fontfile, fontsize)[0]
 
 def personnaliser_pdf_pages(chemin_pdf, prenom_ancien, prenom_nouveau):
@@ -325,7 +354,6 @@ def personnaliser_pdf_pages(chemin_pdf, prenom_ancien, prenom_nouveau):
 
     for page in doc:
 
-        # ── Collecter les LIGNES contenant le prénom ──────────────────────
         lignes_a_reecrire = []
         for bloc in page.get_text("dict")["blocks"]:
             if bloc["type"] != 0: continue
@@ -340,7 +368,6 @@ def personnaliser_pdf_pages(chemin_pdf, prenom_ancien, prenom_nouveau):
                     "centre_x": centre_x,
                 })
 
-        # ── Étape 1 : effacer tous les spans des lignes ciblées ───────────
         for info in lignes_a_reecrire:
             for span in info["spans"]:
                 police_span = police_pour_span(span, cache_polices)
@@ -348,12 +375,10 @@ def personnaliser_pdf_pages(chemin_pdf, prenom_ancien, prenom_nouveau):
                 page.add_redact_annot(zone, fill=(1, 1, 1))
         page.apply_redactions()
 
-        # ── Étape 2 : réécrire chaque ligne en recalculant les positions ──
         for info in lignes_a_reecrire:
             spans     = info["spans"]
             prenom_up = prenom_ancien.upper()
 
-            # Calculer le delta_x : différence de largeur entre ancien et nouveau prénom
             delta_x = 0.0
             for span in spans:
                 if prenom_up in span["text"].upper():
@@ -365,7 +390,6 @@ def personnaliser_pdf_pages(chemin_pdf, prenom_ancien, prenom_nouveau):
                     delta_x = w_nouveau - w_ancien
                     break
 
-            # Réécrire chaque span
             prenom_vu = False
             for span in spans:
                 texte_nouveau = adapter_casse(prenom_nouveau, span["text"], prenom_ancien)
@@ -375,18 +399,14 @@ def personnaliser_pdf_pages(chemin_pdf, prenom_ancien, prenom_nouveau):
                 contient   = prenom_up in span["text"].upper()
 
                 if info["centre"] and contient:
-                    # Centré : recalculer X depuis le centre de la page
                     w_n, _, _ = mesurer_texte(texte_nouveau, police, taille)
                     x_depart = info["centre_x"] - w_n / 2
                 elif contient:
-                    # Span du prénom : position X originale
                     x_depart = span["origin"][0]
                     prenom_vu = True
                 elif prenom_vu and delta_x != 0.0:
-                    # Span APRÈS le prénom : décaler du delta
                     x_depart = span["origin"][0] + delta_x
                 else:
-                    # Span AVANT le prénom : position inchangée
                     x_depart = span["origin"][0]
 
                 page.insert_text(
@@ -403,11 +423,6 @@ def personnaliser_pdf_pages(chemin_pdf, prenom_ancien, prenom_nouveau):
 
 # ── Assemblage PDF final ───────────────────────────────────────────────────
 def compresser_images_pdf(doc, qualite_jpeg: int, max_dim: int = 0):
-    """
-    Recompresse toutes les images PNG/JPEG d'un PDF en JPEG optimisé.
-    - qualite_jpeg : qualité JPEG (1-100)
-    - max_dim      : redimensionner si une dimension dépasse cette valeur (0 = pas de resize)
-    """
     from PIL import Image as PILImage
     import io as _io
 
@@ -418,12 +433,11 @@ def compresser_images_pdf(doc, qualite_jpeg: int, max_dim: int = 0):
                 base = doc.extract_image(xref)
                 data = base["image"]
                 if len(data) < 3000:
-                    continue  # ignorer les petites images (icônes, etc.)
+                    continue
 
                 img = PILImage.open(_io.BytesIO(data)).convert("RGB")
                 w, h = img.size
 
-                # Redimensionner si demandé
                 if max_dim > 0 and max(w, h) > max_dim:
                     ratio = max_dim / max(w, h)
                     img = img.resize((int(w * ratio), int(h * ratio)), PILImage.LANCZOS)
@@ -432,7 +446,6 @@ def compresser_images_pdf(doc, qualite_jpeg: int, max_dim: int = 0):
                 img.save(buf, format="JPEG", quality=qualite_jpeg, optimize=True)
                 new_data = buf.getvalue()
 
-                # Ne remplacer que si ça réduit vraiment
                 if len(new_data) < len(data):
                     doc.update_stream(xref, new_data)
 
@@ -443,10 +456,6 @@ def compresser_images_pdf(doc, qualite_jpeg: int, max_dim: int = 0):
 
 
 def aplatir_pdf(doc, dpi: int, qualite_jpeg: int) -> fitz.Document:
-    """
-    Aplatit un PDF : rasterise chaque page en JPEG puis reconstruit un PDF.
-    Élimine tous les calques et redondances — réduction maximale.
-    """
     from PIL import Image as PILImage
     import io as _io
 
@@ -465,32 +474,30 @@ def aplatir_pdf(doc, dpi: int, qualite_jpeg: int) -> fitz.Document:
 
 
 def assembler_pdf(docs, prenom, compression):
-    """
-    Assemble et compresse le PDF final.
-
-    Niveaux :
-    - aucune  : assemblage simple, aucun retraitement
-    - moyenne : recompression JPEG q=70 + resize max 1200px → ~-75%
-    - forte   : aplatissement complet 150dpi JPEG q=80 → ~-85%
-    """
     pdf_final = fitz.open()
     for doc in docs:
         pdf_final.insert_pdf(doc)
+
+    # Fermer les docs sources pour libérer la mémoire
+    for doc in docs:
+        try: doc.close()
+        except: pass
 
     nom    = f"BD_{prenom.capitalize()}_{uuid.uuid4().hex[:6]}.pdf"
     chemin = os.path.join(OUTPUT_FOLDER, nom)
 
     if compression == "forte":
-        # Aplatissement complet : rasterise tout → JPEG
-        pdf_final = aplatir_pdf(pdf_final, dpi=150, qualite_jpeg=80)
-        pdf_final.save(chemin, garbage=4, deflate=True)
+        pdf_aplati = aplatir_pdf(pdf_final, dpi=150, qualite_jpeg=80)
+        pdf_final.close()
+        pdf_aplati.save(chemin, garbage=4, deflate=True)
+        pdf_aplati.close()
     elif compression == "moyenne":
-        # Recompression intelligente : garde le texte vectoriel
         pdf_final = compresser_images_pdf(pdf_final, qualite_jpeg=70, max_dim=1200)
         pdf_final.save(chemin, garbage=4, deflate=True, clean=True)
+        pdf_final.close()
     else:
-        # Même sans compression d'images, optimiser le flux PDF
         pdf_final.save(chemin, garbage=4, deflate=True, clean=True)
+        pdf_final.close()
 
     return chemin
 
@@ -610,7 +617,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
     <div class="badge">EnfantProdige</div>
     <h1 class="titre">BD <span>Personnalisée</span></h1>
     <p class="sous-titre">BD personnalisée = PDF prêt à envoyer ✨</p>
-    <div class="version-badge">v15/05/2026 08:40</div>
+    <div class="version-badge">v28/05/2026 · Supabase</div>
   </div>
 
   <!-- Onglets -->
@@ -628,7 +635,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
     </select>
 
     <div class="apercu">
-      <div class="ap-avant" id="ap-avant">WILLIAM</div>
+      <div class="ap-avant" id="ap-avant">JOSEPH</div>
       <div class="fleche">→</div>
       <div class="ap-apres" id="ap-apres">…</div>
     </div>
@@ -665,7 +672,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
     <div class="res-taille" id="res-taille"></div>
     <br>
     <a href="#" class="btn-dl" id="btn-dl" download>⬇️ Télécharger le PDF</a>
-    <button class="btn-nouveau" onclick="nouveau()">Personnaliser une autre BD</button>
+    <button class="btn-nouveau" onclick="nouveau()">✨ Générer une autre BD</button>
   </div>
 
   <!-- ═══ ONGLET BIBLIOTHÈQUE ═══ -->
@@ -704,7 +711,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
     <input type="text" class="champ-nom" id="nom-bd" placeholder="Ex : Académie des Génies — Tome 1">
 
     <label class="label">Prénom placeholder dans les pages</label>
-    <input type="text" class="champ-nom" id="prenom-bd" placeholder="Ex : WILLIAM">
+    <input type="text" class="champ-nom" id="prenom-bd" placeholder="Ex : JOSEPH">
 
     <button class="btn-sm" id="btn-upload-bd" onclick="uploadBD()">➕ Ajouter à la bibliothèque</button>
     <div class="progress-wrap" id="progress-wrap" style="display:none;margin-top:12px">
@@ -772,7 +779,7 @@ zoneUp.addEventListener('drop', e => {
   }
 });
 
-let srcMode   = 'upload';  // 'upload' ou 'drive'
+let srcMode   = 'upload';
 
 function setSource(val, btn) {
   srcMode = val;
@@ -795,7 +802,6 @@ async function uploadBD() {
   const btn        = document.getElementById('btn-upload-bd');
   msgEl.className  = 'msg';
 
-  // Récupérer les sources selon le mode
   const f        = inputPdf.files[0];
   const lienBd   = document.getElementById('lien-drive-bd').value.trim();
 
@@ -838,7 +844,6 @@ async function uploadBD() {
       affMsg(msgEl, '✓ BD ajoutée à la bibliothèque !', 'ok');
     }, 600);
 
-    // Reset
     if (inputPdf) inputPdf.value = '';
     document.getElementById('lien-drive-bd').value = '';
     if (zoneUp) zoneUp.classList.remove('ok');
@@ -902,7 +907,7 @@ async function chargerSelectBD() {
 function bdSelectionnee() {
   const sel = document.getElementById('select-bd');
   const opt = sel.options[sel.selectedIndex];
-  document.getElementById('ap-avant').textContent = (opt?.dataset?.prenom || 'WILLIAM').toUpperCase();
+  document.getElementById('ap-avant').textContent = (opt?.dataset?.prenom || 'JOSEPH').toUpperCase();
   majApercu();
 }
 
@@ -931,6 +936,7 @@ async function generer() {
   document.getElementById('btn-gen').disabled = true;
   document.getElementById('loader').classList.add('actif');
   document.getElementById('resultat').classList.remove('actif');
+  document.getElementById('carte-perso').style.display = 'block';
 
   majProgression(0, 'Démarrage…');
 
@@ -949,6 +955,7 @@ async function generer() {
       reader.read().then(({ done, value }) => {
         if (done) {
           document.getElementById('btn-gen').disabled = false;
+          document.getElementById('loader').classList.remove('actif');
           return;
         }
         buffer += decoder.decode(value, { stream: true });
@@ -975,8 +982,6 @@ async function generer() {
               document.getElementById('res-taille').textContent = '📦 ' + evt.taille_mo + ' Mo';
               document.getElementById('btn-dl').href = '/telecharger/' + evt.fichier;
               document.getElementById('btn-dl').download = 'BD_' + prenom_cap + '.pdf';
-              // Masquer le formulaire, afficher le résultat
-              document.getElementById('carte-perso').style.display = 'none';
               document.getElementById('resultat').classList.add('actif');
               document.getElementById('btn-gen').disabled = false;
               return;
@@ -1005,6 +1010,7 @@ function nouveau() {
   document.getElementById('prenom-nouveau').value = '';
   document.getElementById('ap-apres').textContent = '…';
   majProgression(0, '');
+  document.getElementById('err-perso').className = 'msg err';
 }
 
 function affMsg(el, txt, cls) {
@@ -1027,7 +1033,7 @@ def index():
 
 @app.route("/ajouter-bd", methods=["POST"])
 def ajouter_bd():
-    fichier      = request.files.get("pdf")
+    fichier   = request.files.get("pdf")
     lien_bd   = request.form.get("lien_drive_bd","").strip()
     nom       = request.form.get("nom","").strip()
     prenom_bd = request.form.get("prenom","").strip().upper()
@@ -1038,7 +1044,11 @@ def ajouter_bd():
         return jsonify({"erreur":"Fournis un fichier PDF ou un lien Google Drive"}), 400
 
     bd_id     = uuid.uuid4().hex[:10]
-    chemin_bd = os.path.join(BIBLIO_FOLDER, f"{bd_id}_bd.pdf")
+    nom_pages = f"{bd_id}_bd.pdf"
+    chemin_bd = os.path.join(BIBLIO_FOLDER, nom_pages)
+
+    source    = "upload"
+    drive_url = ""
 
     if fichier:
         fichier.save(chemin_bd)
@@ -1046,19 +1056,19 @@ def ajouter_bd():
         try:
             chemin_tmp = telecharger_drive(lien_bd)
             os.rename(chemin_tmp, chemin_bd)
+            source    = "drive"
+            drive_url = lien_bd
         except Exception as e:
             return jsonify({"erreur": f"Erreur téléchargement : {str(e)}"}), 400
 
-    meta = lire_meta()
-    meta[bd_id] = {
-        "id":       bd_id,
-        "nom":      nom,
-        "prenom":   prenom_bd,
-        "pages":    f"{bd_id}_bd.pdf",
-        "source":   lien_bd or "upload"
-    }
-    ecrire_meta(meta)
-    return jsonify({"succes":True,"id":bd_id})
+    ecrire_bd_supa(bd_id, {
+        "nom":       nom,
+        "prenom":    prenom_bd,
+        "pages":     nom_pages,
+        "source":    source,
+        "drive_url": drive_url
+    })
+    return jsonify({"succes": True, "id": bd_id})
 
 @app.route("/liste-bds")
 def liste_bds():
@@ -1069,29 +1079,27 @@ def liste_bds():
             "id":          bd["id"],
             "nom":         bd["nom"],
             "prenom":      bd["prenom"],
-            "prenom_couv": bd.get("prenom_couv",""),
-            "couverture":  bool(bd.get("couverture")),
-            "type_couv":   bd.get("type_couv","separee"),
-            "source_bd":   bd.get("source_bd","upload"),
+            "source":      bd.get("source","upload"),
+            "couverture":  False,
         })
     return jsonify({"bds": bds})
 
 @app.route("/supprimer-bd/<bd_id>", methods=["DELETE"])
 def supprimer_bd(bd_id):
     meta = lire_meta()
-    if bd_id not in meta: return jsonify({"erreur":"BD introuvable"}), 404
+    if bd_id not in meta:
+        return jsonify({"erreur":"BD introuvable"}), 404
     bd = meta[bd_id]
-    # Supprimer le fichier PDF
     nom_fichier = bd.get("pages") or bd.get("fichier", "")
     if nom_fichier:
         chemin = os.path.join(BIBLIO_FOLDER, nom_fichier)
-        if os.path.exists(chemin): os.remove(chemin)
-    del meta[bd_id]
-    ecrire_meta(meta)
-    return jsonify({"succes":True})
+        if os.path.exists(chemin):
+            try: os.remove(chemin)
+            except: pass
+    supprimer_bd_supa(bd_id)
+    return jsonify({"succes": True})
 
 def _stream_generer(bd_id, prenom_nouveau, compression):
-    """Générateur SSE — envoie la progression étape par étape."""
     import json as _json
 
     def evt(pct, msg, data=None):
@@ -1105,17 +1113,17 @@ def _stream_generer(bd_id, prenom_nouveau, compression):
         return
 
     bd            = meta[bd_id]
-    nom_pages     = bd.get("pages") or bd.get("fichier","")
-    chemin_bd     = os.path.join(BIBLIO_FOLDER, nom_pages)
     prenom_ancien = bd["prenom"]
-    if not os.path.exists(chemin_bd):
-        yield evt(0, "Erreur", {"erreur": f"Fichier BD introuvable : {nom_pages}"})
+
+    yield evt(5, "📥 Vérification du fichier BD…")
+    chemin_bd = _assurer_fichier_bd(bd)
+    if not chemin_bd:
+        yield evt(0, "Erreur", {"erreur": f"Fichier BD introuvable. Vérifiez le lien Drive."})
         return
 
     docs_a_assembler = []
-    yield evt(10, "📄 Fichier BD chargé…")
+    yield evt(15, "📄 Fichier BD chargé…")
 
-    # ── Étape 2 : Pages BD ─────────────────────────────────────────────────
     yield evt(35, f"📝 Remplacement de « {prenom_ancien} » par « {prenom_nouveau} »…")
     try:
         doc_bd, nb = personnaliser_pdf_pages(chemin_bd, prenom_ancien, prenom_nouveau)
@@ -1130,7 +1138,6 @@ def _stream_generer(bd_id, prenom_nouveau, compression):
 
     yield evt(65, f"✅ {nb} occurrence(s) remplacée(s) dans la BD")
 
-    # ── Étape 3 : Assemblage ───────────────────────────────────────────────
     yield evt(70, "📎 Assemblage du PDF…")
     try:
         chemin_final = assembler_pdf(docs_a_assembler, prenom_nouveau, compression)
@@ -1141,14 +1148,14 @@ def _stream_generer(bd_id, prenom_nouveau, compression):
     yield evt(90, f"🗜️ Compression ({compression})…")
 
     taille_mo = round(os.path.getsize(chemin_final) / (1024*1024), 1)
-    nb_pages  = len(fitz.open(chemin_final))
+    with fitz.open(chemin_final) as tmp_doc:
+        nb_pages = len(tmp_doc)
 
     yield evt(100, f"🎉 PDF prêt — {nb_pages} pages, {taille_mo} Mo", {
-        "succes":          True,
-        "fichier":         os.path.basename(chemin_final),
-        "taille_mo":       taille_mo,
-        "pages":           nb_pages,
-        "avec_couverture": bool(bd.get("couverture"))
+        "succes":    True,
+        "fichier":   os.path.basename(chemin_final),
+        "taille_mo": taille_mo,
+        "pages":     nb_pages,
     })
 
 
@@ -1164,15 +1171,18 @@ def generer():
         stream_with_context(_stream_generer(bd_id, prenom_nouveau, compression)),
         mimetype="text/event-stream",
         headers={
-            "Cache-Control":   "no-cache",
+            "Cache-Control":     "no-cache",
             "X-Accel-Buffering": "no"
         }
     )
 
 @app.route("/telecharger/<nom>")
 def telecharger(nom):
+    # Sécuriser le nom de fichier
+    nom = os.path.basename(nom)
     chemin = os.path.join(OUTPUT_FOLDER, nom)
-    if not os.path.exists(chemin): return "Fichier introuvable", 404
+    if not os.path.exists(chemin):
+        return "Fichier introuvable", 404
 
     @after_this_request
     def _supprimer(response):
@@ -1184,7 +1194,7 @@ def telecharger(nom):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# WEBHOOK CHARIOW — Réception paiement + génération PDF automatique
+# WEBHOOK CHARIOW
 # ══════════════════════════════════════════════════════════════════════════════
 
 import threading
@@ -1194,21 +1204,18 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
 
-# Variables d'environnement pour l'envoi email
-SMTP_HOST     = os.environ.get("SMTP_HOST", "")
-SMTP_PORT     = int(os.environ.get("SMTP_PORT", "587"))
-SMTP_USER     = os.environ.get("SMTP_USER", "")
-SMTP_PASSWORD = os.environ.get("SMTP_PASS", "")
-EMAIL_FROM    = os.environ.get("EMAIL_FROM", "")
-APP_URL       = os.environ.get("APP_URL", "https://bd-personnalisee.onrender.com")
+SMTP_HOST      = os.environ.get("SMTP_HOST", "")
+SMTP_PORT      = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER      = os.environ.get("SMTP_USER", "")
+SMTP_PASSWORD  = os.environ.get("SMTP_PASS", "")
+EMAIL_FROM     = os.environ.get("EMAIL_FROM", "")
+APP_URL        = os.environ.get("APP_URL", "https://bd-personnalisee.onrender.com")
 CHARIOW_SECRET = os.environ.get("CHARIOW_WEBHOOK_SECRET", "")
 
-# ── Clé de déduplication (évite les doublons en cas de retry Chariow) ────────
 _processed_sales = set()
 
 
 def envoyer_email_pdf(destinataire: str, prenom: str, chemin_pdf: str, nom_bd: str):
-    """Envoie le PDF personnalisé par email au client."""
     if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_FROM]):
         print(f"⚠️ SMTP non configuré — email non envoyé à {destinataire}")
         return False
@@ -1230,7 +1237,6 @@ Bonne lecture ! 🎉
 """
         msg.attach(MIMEText(corps, "plain", "utf-8"))
 
-        # Attacher le PDF
         with open(chemin_pdf, "rb") as f:
             part = MIMEBase("application", "octet-stream")
             part.set_payload(f.read())
@@ -1253,10 +1259,6 @@ Bonne lecture ! 🎉
 
 def traiter_commande(sale_id: str, prenom: str, email_client: str,
                      bd_id: str, compression: str = "moyenne"):
-    """
-    Traitement asynchrone : personnalise la BD et envoie l'email.
-    Appelé dans un thread séparé pour répondre 200 à Chariow immédiatement.
-    """
     print(f"🔄 Traitement commande {sale_id} — prénom: {prenom} — BD: {bd_id}")
 
     meta = lire_meta()
@@ -1266,15 +1268,14 @@ def traiter_commande(sale_id: str, prenom: str, email_client: str,
 
     bd = meta[bd_id]
     nom_bd        = bd["nom"]
-    nom_pages     = bd.get("pages") or bd.get("fichier", "")
-    chemin_bd     = os.path.join(BIBLIO_FOLDER, nom_pages)
     prenom_ancien = bd["prenom"]
-    if not os.path.exists(chemin_bd):
-        print(f"❌ Fichier BD introuvable : {chemin_bd}")
+
+    chemin_bd = _assurer_fichier_bd(bd)
+    if not chemin_bd:
+        print(f"❌ Fichier BD introuvable : {bd.get('id')}")
         return
 
     docs = []
-    # Pages BD
     try:
         doc_bd, nb = personnaliser_pdf_pages(chemin_bd, prenom_ancien, prenom)
         docs.append(doc_bd)
@@ -1287,7 +1288,6 @@ def traiter_commande(sale_id: str, prenom: str, email_client: str,
         print("❌ Aucun document à assembler")
         return
 
-    # Assemblage
     try:
         chemin_final = assembler_pdf(docs, prenom, compression)
         print(f"✅ PDF généré : {chemin_final}")
@@ -1295,24 +1295,13 @@ def traiter_commande(sale_id: str, prenom: str, email_client: str,
         print(f"❌ Erreur assemblage : {e}")
         return
 
-    # Envoi email
     envoyer_email_pdf(email_client, prenom, chemin_final, nom_bd)
 
 
 @app.route("/api/webhook/chariow", methods=["POST"])
 def webhook_chariow():
-    """
-    Reçoit le webhook Chariow (successful.sale) et déclenche la génération PDF.
-
-    Champs attendus dans custom_fields ou custom_metadata :
-      - prenom_enfant : prénom à personnaliser (obligatoire)
-      - bd_id         : identifiant de la BD dans la bibliothèque (obligatoire)
-      - compression   : aucune | moyenne | forte (optionnel, défaut: moyenne)
-    """
-    # ── 1. Répondre 200 immédiatement (Chariow attend < 30s) ─────────────────
     data = request.get_json(silent=True) or {}
 
-    # ── 2. Vérifier que c'est bien une vente réussie ─────────────────────────
     event = data.get("event", "")
     if event != "successful.sale":
         return jsonify({"status": "ignored", "event": event}), 200
@@ -1322,13 +1311,10 @@ def webhook_chariow():
     customer = data.get("customer", {})
     email_client = customer.get("email", "")
 
-    # ── 3. Déduplication (retry Chariow) ──────────────────────────────────────
     if sale_id in _processed_sales:
         return jsonify({"status": "duplicate", "sale_id": sale_id}), 200
     _processed_sales.add(sale_id)
 
-    # ── 4. Récupérer le prénom et le bd_id ────────────────────────────────────
-    # Chercher dans custom_fields ET custom_metadata
     custom_fields   = sale.get("custom_fields")   or {}
     custom_metadata = sale.get("custom_metadata") or {}
     all_custom = {**custom_metadata, **custom_fields}
@@ -1342,7 +1328,6 @@ def webhook_chariow():
     if not bd_id:
         return jsonify({"status": "erreur", "message": "bd_id manquant"}), 400
 
-    # ── 5. Lancer le traitement en arrière-plan ───────────────────────────────
     thread = threading.Thread(
         target=traiter_commande,
         args=(sale_id, prenom, email_client, bd_id, compression),
@@ -1351,29 +1336,15 @@ def webhook_chariow():
     thread.start()
 
     return jsonify({
-        "status": "accepted",
+        "status":  "accepted",
         "sale_id": sale_id,
-        "prenom": prenom,
-        "bd_id": bd_id
+        "prenom":  prenom,
+        "bd_id":   bd_id
     }), 200
 
 
 @app.route("/api/generer-bd", methods=["POST"])
 def api_generer_bd():
-    """
-    Route API directe pour générer une BD personnalisée.
-    Utile pour les intégrations custom (site web, app mobile, etc.)
-
-    Body JSON attendu :
-    {
-        "bd_id": "identifiant_bd",
-        "prenom": "AMINATA",
-        "email": "parent@email.com",    (optionnel — pour envoi email)
-        "compression": "moyenne"         (optionnel)
-    }
-
-    Retourne : { succes, fichier, taille_mo, pages, lien_telechargement }
-    """
     data = request.get_json(silent=True) or {}
 
     bd_id       = data.get("bd_id", "").strip()
@@ -1391,15 +1362,13 @@ def api_generer_bd():
         return jsonify({"erreur": f"BD introuvable : {bd_id}"}), 404
 
     bd            = meta[bd_id]
-    nom_pages     = bd.get("pages") or bd.get("fichier", "")
-    chemin_bd     = os.path.join(BIBLIO_FOLDER, nom_pages)
     prenom_ancien = bd["prenom"]
-    if not os.path.exists(chemin_bd):
+
+    chemin_bd = _assurer_fichier_bd(bd)
+    if not chemin_bd:
         return jsonify({"erreur": "Fichier BD introuvable sur le serveur"}), 404
 
     docs = []
-
-    # Pages BD
     try:
         doc_bd, nb = personnaliser_pdf_pages(chemin_bd, prenom_ancien, prenom)
         docs.append(doc_bd)
@@ -1409,7 +1378,6 @@ def api_generer_bd():
     if nb == 0:
         return jsonify({"erreur": f"'{prenom_ancien}' introuvable dans le PDF"}), 404
 
-    # Assemblage
     try:
         chemin_final = assembler_pdf(docs, prenom, compression)
     except Exception as e:
@@ -1417,10 +1385,10 @@ def api_generer_bd():
 
     nom_fichier = os.path.basename(chemin_final)
     taille_mo   = round(os.path.getsize(chemin_final) / (1024*1024), 1)
-    nb_pages    = len(fitz.open(chemin_final))
-    lien        = f"{APP_URL}/telecharger/{nom_fichier}"
+    with fitz.open(chemin_final) as tmp_doc:
+        nb_pages = len(tmp_doc)
+    lien = f"{APP_URL}/telecharger/{nom_fichier}"
 
-    # Envoi email si fourni
     if email:
         threading.Thread(
             target=envoyer_email_pdf,
@@ -1429,29 +1397,22 @@ def api_generer_bd():
         ).start()
 
     return jsonify({
-        "succes":               True,
-        "fichier":              nom_fichier,
-        "taille_mo":            taille_mo,
-        "pages":                nb_pages,
-        "lien_telechargement":  lien,
-        "avec_couverture":      bool(bd.get("couverture"))
+        "succes":              True,
+        "fichier":             nom_fichier,
+        "taille_mo":           taille_mo,
+        "pages":               nb_pages,
+        "lien_telechargement": lien,
     }), 200
 
 
 @app.route("/api/bds", methods=["GET"])
 def api_liste_bds():
-    """
-    Liste toutes les BDs disponibles dans la bibliothèque.
-    Utile pour construire un sélecteur côté site web.
-    """
     meta = lire_meta()
     bds  = [
         {
-            "id":          bd["id"],
-            "nom":         bd["nom"],
-            "prenom":      bd["prenom"],
-            "couverture":  bool(bd.get("couverture")),
-            "type_couv":   bd.get("type_couv", "separee")
+            "id":     bd["id"],
+            "nom":    bd["nom"],
+            "prenom": bd["prenom"],
         }
         for bd in meta.values()
     ]
