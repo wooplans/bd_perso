@@ -27,18 +27,28 @@ def _supa_headers():
         "Prefer": "return=representation"
     }
 
+_meta_cache = None
+
+def _invalider_cache():
+    global _meta_cache
+    _meta_cache = None
+
 def lire_meta():
-    """Lit la bibliothèque depuis Supabase. Retourne {id: bd_dict}."""
+    """Lit la bibliothèque depuis Supabase avec cache in-process."""
+    global _meta_cache
+    if _meta_cache is not None:
+        return _meta_cache
     try:
         resp = _requests.get(
             f"{SUPABASE_URL}/rest/v1/bd_bibliotheque?select=*&order=created_at",
             headers=_supa_headers(), timeout=10
         )
         if resp.status_code == 200:
-            return {bd["id"]: bd for bd in resp.json()}
+            _meta_cache = {bd["id"]: bd for bd in resp.json()}
+            return _meta_cache
     except Exception as e:
         print(f"⚠️ Supabase lire_meta erreur: {e}")
-    return {}
+    return _meta_cache or {}
 
 def ecrire_bd_supa(bd_id, data):
     """Insère une nouvelle BD dans Supabase."""
@@ -732,6 +742,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 
 <script>
 let compression = 'moyenne';
+let activeReader = null;
 
 // ── Onglets ──────────────────────────────────────────────────────────────────
 function changerOnglet(id, btn) {
@@ -933,6 +944,9 @@ async function generer() {
   if (!bdId)    { affMsg(errEl,'Sélectionne une BD.','err'); return; }
   if (!nouveau) { affMsg(errEl,"Entre le prénom de l'enfant.",'err'); return; }
 
+  // Annuler toute lecture SSE en cours avant d'en démarrer une nouvelle
+  if (activeReader) { try { activeReader.cancel(); } catch(e) {} activeReader = null; }
+
   document.getElementById('btn-gen').disabled = true;
   document.getElementById('loader').classList.add('actif');
   document.getElementById('resultat').classList.remove('actif');
@@ -948,12 +962,14 @@ async function generer() {
     body: JSON.stringify({ bd_id: bdId, prenom_nouveau: nouveau, compression })
   }).then(response => {
     const reader = response.body.getReader();
+    activeReader = reader;
     const decoder = new TextDecoder();
     let buffer = '';
 
     function lire() {
       reader.read().then(({ done, value }) => {
         if (done) {
+          activeReader = null;
           document.getElementById('btn-gen').disabled = false;
           document.getElementById('loader').classList.remove('actif');
           return;
@@ -969,12 +985,14 @@ async function generer() {
             majProgression(evt.pct, evt.msg);
 
             if (evt.erreur) {
+              reader.cancel(); activeReader = null;
               affMsg(errEl, evt.erreur, 'err');
               document.getElementById('btn-gen').disabled = false;
               document.getElementById('loader').classList.remove('actif');
               return;
             }
             if (evt.succes) {
+              reader.cancel(); activeReader = null;
               document.getElementById('loader').classList.remove('actif');
               document.getElementById('res-titre').textContent = 'PDF de ' + prenom_cap + ' prêt ! 🎉';
               document.getElementById('res-info').textContent =
@@ -990,6 +1008,7 @@ async function generer() {
         }
         lire();
       }).catch(e => {
+        activeReader = null;
         affMsg(errEl, 'Erreur lecture : ' + e.message, 'err');
         document.getElementById('btn-gen').disabled = false;
         document.getElementById('loader').classList.remove('actif');
@@ -997,6 +1016,7 @@ async function generer() {
     }
     lire();
   }).catch(e => {
+    activeReader = null;
     affMsg(errEl, 'Erreur : ' + e.message, 'err');
     document.getElementById('btn-gen').disabled = false;
     document.getElementById('loader').classList.remove('actif');
@@ -1005,8 +1025,11 @@ async function generer() {
 
 
 function nouveau() {
+  if (activeReader) { try { activeReader.cancel(); } catch(e) {} activeReader = null; }
   document.getElementById('resultat').classList.remove('actif');
   document.getElementById('carte-perso').style.display = 'block';
+  document.getElementById('loader').classList.remove('actif');
+  document.getElementById('btn-gen').disabled = false;
   document.getElementById('prenom-nouveau').value = '';
   document.getElementById('ap-apres').textContent = '…';
   majProgression(0, '');
@@ -1068,6 +1091,7 @@ def ajouter_bd():
         "source":    source,
         "drive_url": drive_url
     })
+    _invalider_cache()
     return jsonify({"succes": True, "id": bd_id})
 
 @app.route("/liste-bds")
@@ -1097,6 +1121,7 @@ def supprimer_bd(bd_id):
             try: os.remove(chemin)
             except: pass
     supprimer_bd_supa(bd_id)
+    _invalider_cache()
     return jsonify({"succes": True})
 
 def _stream_generer(bd_id, prenom_nouveau, compression):
