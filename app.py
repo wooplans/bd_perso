@@ -664,6 +664,16 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
       <button class="comp-btn" onclick="setComp('forte',this)">🗜️ Forte</button>
     </div>
 
+    <!-- Couverture -->
+    <label class="label">Couverture personnalisée (optionnel)</label>
+    <div class="zone-upload" id="zone-couv" style="margin-bottom:14px">
+      <input type="file" id="input-couv" accept=".pdf">
+      <span class="icone">🖼️</span>
+      <div class="lbl">PDF de la couverture (1 page)</div>
+      <div class="sub">Remplace la 1ère page de la BD</div>
+      <div class="nom-fichier" id="nom-couv"></div>
+    </div>
+
     <button class="btn" id="btn-gen" onclick="generer()">🚀 Générer le PDF final</button>
 
     <div class="loader" id="loader">
@@ -725,16 +735,6 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
     <label class="label">Prénom placeholder dans les pages</label>
     <input type="text" class="champ-nom" id="prenom-bd" placeholder="Ex : JOSEPH">
 
-    <div class="sep"></div>
-    <label class="label">Couverture personnalisée (optionnel)</label>
-    <div class="zone-upload" id="zone-couv" style="margin-bottom:14px">
-      <input type="file" id="input-couv" accept=".pdf">
-      <span class="icone">🖼️</span>
-      <div class="lbl">PDF de la couverture (1 page)</div>
-      <div class="sub">Remplace la 1ère page de la BD</div>
-      <div class="nom-fichier" id="nom-couv"></div>
-    </div>
-
     <button class="btn-sm" id="btn-upload-bd" onclick="uploadBD()">➕ Ajouter à la bibliothèque</button>
     <div class="progress-wrap" id="progress-wrap" style="display:none;margin-top:12px">
       <div class="progress-bar" id="progress-bar"></div>
@@ -795,6 +795,8 @@ inputCouv.addEventListener('change', () => {
   if (f) {
     zoneCouv.classList.add('ok'); nomCouv.style.display = 'block';
     nomCouv.textContent = '✓ ' + f.name;
+  } else {
+    zoneCouv.classList.remove('ok'); nomCouv.style.display = 'none';
   }
 });
 
@@ -858,9 +860,6 @@ async function uploadBD() {
     fd.append('lien_drive_bd', lienBd);
   }
 
-  const couv = inputCouv.files[0];
-  if (couv) fd.append('couverture', couv);
-
   setProgress(30, 'Envoi en cours…');
 
   try {
@@ -885,9 +884,6 @@ async function uploadBD() {
     document.getElementById('lien-drive-bd').value = '';
     if (zoneUp) zoneUp.classList.remove('ok');
     if (nomFich) nomFich.style.display = 'none';
-    if (inputCouv) inputCouv.value = '';
-    if (zoneCouv) zoneCouv.classList.remove('ok');
-    if (nomCouv) nomCouv.style.display = 'none';
     document.getElementById('nom-bd').value = '';
     document.getElementById('prenom-bd').value = '';
     chargerListe(); chargerSelectBD();
@@ -985,11 +981,24 @@ async function generer() {
 
   const prenom_cap = nouveau.charAt(0).toUpperCase() + nouveau.slice(1).toLowerCase();
 
-  fetch('/generer', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ bd_id: bdId, prenom_nouveau: nouveau, compression })
-  }).then(response => {
+  const couv = inputCouv.files[0];
+  let fetchOpts;
+  if (couv) {
+    const fd = new FormData();
+    fd.append('bd_id', bdId);
+    fd.append('prenom_nouveau', nouveau);
+    fd.append('compression', compression);
+    fd.append('couverture', couv);
+    fetchOpts = { method: 'POST', body: fd };
+  } else {
+    fetchOpts = {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bd_id: bdId, prenom_nouveau: nouveau, compression })
+    };
+  }
+
+  fetch('/generer', fetchOpts).then(response => {
     const reader = response.body.getReader();
     activeReader = reader;
     const decoder = new TextDecoder();
@@ -1061,6 +1070,9 @@ function nouveau() {
   document.getElementById('btn-gen').disabled = false;
   document.getElementById('prenom-nouveau').value = '';
   document.getElementById('ap-apres').textContent = '…';
+  if (inputCouv) inputCouv.value = '';
+  if (zoneCouv) zoneCouv.classList.remove('ok');
+  if (nomCouv) nomCouv.style.display = 'none';
   majProgression(0, '');
   document.getElementById('err-perso').className = 'msg err';
 }
@@ -1099,11 +1111,10 @@ def _remplacer_couverture(chemin_bd, chemin_couverture):
 
 @app.route("/ajouter-bd", methods=["POST"])
 def ajouter_bd():
-    fichier     = request.files.get("pdf")
-    couverture  = request.files.get("couverture")
-    lien_bd     = request.form.get("lien_drive_bd","").strip()
-    nom         = request.form.get("nom","").strip()
-    prenom_bd   = request.form.get("prenom","").strip().upper()
+    fichier   = request.files.get("pdf")
+    lien_bd   = request.form.get("lien_drive_bd","").strip()
+    nom       = request.form.get("nom","").strip()
+    prenom_bd = request.form.get("prenom","").strip().upper()
 
     if not nom or not prenom_bd:
         return jsonify({"erreur":"Nom et prénom obligatoires"}), 400
@@ -1127,17 +1138,6 @@ def ajouter_bd():
             drive_url = lien_bd
         except Exception as e:
             return jsonify({"erreur": f"Erreur téléchargement : {str(e)}"}), 400
-
-    if couverture:
-        chemin_couv = os.path.join(BIBLIO_FOLDER, f"{bd_id}_couv.pdf")
-        couverture.save(chemin_couv)
-        try:
-            _remplacer_couverture(chemin_bd, chemin_couv)
-        except Exception as e:
-            return jsonify({"erreur": f"Erreur couverture : {str(e)}"}), 400
-        finally:
-            if os.path.exists(chemin_couv):
-                os.remove(chemin_couv)
 
     ecrire_bd_supa(bd_id, {
         "nom":       nom,
@@ -1179,7 +1179,7 @@ def supprimer_bd(bd_id):
     _invalider_cache()
     return jsonify({"succes": True})
 
-def _stream_generer(bd_id, prenom_nouveau, compression):
+def _stream_generer(bd_id, prenom_nouveau, compression, chemin_couverture=None):
     import json as _json
 
     def evt(pct, msg, data=None):
@@ -1200,6 +1200,21 @@ def _stream_generer(bd_id, prenom_nouveau, compression):
     if not chemin_bd:
         yield evt(0, "Erreur", {"erreur": f"Fichier BD introuvable. Vérifiez le lien Drive."})
         return
+
+    if chemin_couverture:
+        yield evt(10, "🖼️ Remplacement de la couverture…")
+        try:
+            copie_bd = os.path.join(OUTPUT_FOLDER, f"tmp_{uuid.uuid4().hex[:8]}.pdf")
+            import shutil
+            shutil.copy2(chemin_bd, copie_bd)
+            _remplacer_couverture(copie_bd, chemin_couverture)
+            chemin_bd = copie_bd
+        except Exception as e:
+            yield evt(0, "Erreur", {"erreur": f"Erreur couverture : {str(e)}"})
+            return
+        finally:
+            if os.path.exists(chemin_couverture):
+                os.remove(chemin_couverture)
 
     docs_a_assembler = []
     yield evt(15, "📄 Fichier BD chargé…")
@@ -1241,14 +1256,25 @@ def _stream_generer(bd_id, prenom_nouveau, compression):
 
 @app.route("/generer", methods=["POST"])
 def generer():
-    data           = request.json
-    bd_id          = data.get("bd_id","")
-    prenom_nouveau = data.get("prenom_nouveau","").strip()
-    compression    = data.get("compression","moyenne")
+    chemin_couverture = None
+
+    if request.content_type and "multipart/form-data" in request.content_type:
+        bd_id          = request.form.get("bd_id", "")
+        prenom_nouveau = request.form.get("prenom_nouveau", "").strip()
+        compression    = request.form.get("compression", "moyenne")
+        couv_file      = request.files.get("couverture")
+        if couv_file:
+            chemin_couverture = os.path.join(OUTPUT_FOLDER, f"couv_{uuid.uuid4().hex[:8]}.pdf")
+            couv_file.save(chemin_couverture)
+    else:
+        data           = request.json
+        bd_id          = data.get("bd_id", "")
+        prenom_nouveau = data.get("prenom_nouveau", "").strip()
+        compression    = data.get("compression", "moyenne")
 
     from flask import Response, stream_with_context
     return Response(
-        stream_with_context(_stream_generer(bd_id, prenom_nouveau, compression)),
+        stream_with_context(_stream_generer(bd_id, prenom_nouveau, compression, chemin_couverture)),
         mimetype="text/event-stream",
         headers={
             "Cache-Control":     "no-cache",
