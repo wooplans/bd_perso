@@ -501,12 +501,12 @@ def assembler_pdf(docs, prenom, compression):
     chemin = os.path.join(OUTPUT_FOLDER, nom)
 
     if compression == "forte":
-        pdf_aplati = aplatir_pdf(pdf_final, dpi=120, qualite_jpeg=72)
+        pdf_aplati = aplatir_pdf(pdf_final, dpi=150, qualite_jpeg=80)
         pdf_final.close()
         pdf_aplati.save(chemin, garbage=4, deflate=True)
         pdf_aplati.close()
     elif compression == "moyenne":
-        pdf_final = compresser_images_pdf(pdf_final, qualite_jpeg=60, max_dim=800)
+        pdf_final = compresser_images_pdf(pdf_final, qualite_jpeg=70, max_dim=1200)
         pdf_final.save(chemin, garbage=4, deflate=True, clean=True)
         pdf_final.close()
     else:
