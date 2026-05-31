@@ -2,6 +2,7 @@ FROM python:3.11-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-comic-neue \
+    wget \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -11,7 +12,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-RUN mkdir -p bibliotheque output fonts
+RUN mkdir -p bibliotheque output fonts \
+    && wget -q "https://github.com/wooplans/bd_perso/raw/main/comic.ttf" -O /app/comic.ttf || true
 
 EXPOSE 7860
 

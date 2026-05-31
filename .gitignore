@@ -4,3 +4,5 @@ bibliotheque/
 output/
 fonts/
 .env
+*.ttf
+*.otf
