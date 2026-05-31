@@ -725,6 +725,16 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
     <label class="label">Prénom placeholder dans les pages</label>
     <input type="text" class="champ-nom" id="prenom-bd" placeholder="Ex : JOSEPH">
 
+    <div class="sep"></div>
+    <label class="label">Couverture personnalisée (optionnel)</label>
+    <div class="zone-upload" id="zone-couv" style="margin-bottom:14px">
+      <input type="file" id="input-couv" accept=".pdf">
+      <span class="icone">🖼️</span>
+      <div class="lbl">PDF de la couverture (1 page)</div>
+      <div class="sub">Remplace la 1ère page de la BD</div>
+      <div class="nom-fichier" id="nom-couv"></div>
+    </div>
+
     <button class="btn-sm" id="btn-upload-bd" onclick="uploadBD()">➕ Ajouter à la bibliothèque</button>
     <div class="progress-wrap" id="progress-wrap" style="display:none;margin-top:12px">
       <div class="progress-bar" id="progress-bar"></div>
@@ -774,6 +784,17 @@ inputPdf.addEventListener('change', () => {
     nomFich.textContent = '✓ ' + f.name;
     if (!document.getElementById('nom-bd').value)
       document.getElementById('nom-bd').value = f.name.replace('.pdf','');
+  }
+});
+
+const inputCouv = document.getElementById('input-couv');
+const zoneCouv  = document.getElementById('zone-couv');
+const nomCouv   = document.getElementById('nom-couv');
+inputCouv.addEventListener('change', () => {
+  const f = inputCouv.files[0];
+  if (f) {
+    zoneCouv.classList.add('ok'); nomCouv.style.display = 'block';
+    nomCouv.textContent = '✓ ' + f.name;
   }
 });
 
@@ -837,6 +858,9 @@ async function uploadBD() {
     fd.append('lien_drive_bd', lienBd);
   }
 
+  const couv = inputCouv.files[0];
+  if (couv) fd.append('couverture', couv);
+
   setProgress(30, 'Envoi en cours…');
 
   try {
@@ -861,6 +885,9 @@ async function uploadBD() {
     document.getElementById('lien-drive-bd').value = '';
     if (zoneUp) zoneUp.classList.remove('ok');
     if (nomFich) nomFich.style.display = 'none';
+    if (inputCouv) inputCouv.value = '';
+    if (zoneCouv) zoneCouv.classList.remove('ok');
+    if (nomCouv) nomCouv.style.display = 'none';
     document.getElementById('nom-bd').value = '';
     document.getElementById('prenom-bd').value = '';
     chargerListe(); chargerSelectBD();
@@ -1056,12 +1083,27 @@ chargerSelectBD();
 def index():
     return HTML
 
+def _remplacer_couverture(chemin_bd, chemin_couverture):
+    doc_bd = fitz.open(chemin_bd)
+    doc_couv = fitz.open(chemin_couverture)
+    if len(doc_couv) == 0:
+        doc_couv.close()
+        doc_bd.close()
+        return
+    doc_bd.delete_page(0)
+    doc_bd.insert_pdf(doc_couv, from_page=0, to_page=0, start_at=0)
+    doc_bd.save(chemin_bd, incremental=False, encryption=fitz.PDF_ENCRYPT_NONE)
+    doc_bd.close()
+    doc_couv.close()
+
+
 @app.route("/ajouter-bd", methods=["POST"])
 def ajouter_bd():
-    fichier   = request.files.get("pdf")
-    lien_bd   = request.form.get("lien_drive_bd","").strip()
-    nom       = request.form.get("nom","").strip()
-    prenom_bd = request.form.get("prenom","").strip().upper()
+    fichier     = request.files.get("pdf")
+    couverture  = request.files.get("couverture")
+    lien_bd     = request.form.get("lien_drive_bd","").strip()
+    nom         = request.form.get("nom","").strip()
+    prenom_bd   = request.form.get("prenom","").strip().upper()
 
     if not nom or not prenom_bd:
         return jsonify({"erreur":"Nom et prénom obligatoires"}), 400
@@ -1085,6 +1127,17 @@ def ajouter_bd():
             drive_url = lien_bd
         except Exception as e:
             return jsonify({"erreur": f"Erreur téléchargement : {str(e)}"}), 400
+
+    if couverture:
+        chemin_couv = os.path.join(BIBLIO_FOLDER, f"{bd_id}_couv.pdf")
+        couverture.save(chemin_couv)
+        try:
+            _remplacer_couverture(chemin_bd, chemin_couv)
+        except Exception as e:
+            return jsonify({"erreur": f"Erreur couverture : {str(e)}"}), 400
+        finally:
+            if os.path.exists(chemin_couv):
+                os.remove(chemin_couv)
 
     ecrire_bd_supa(bd_id, {
         "nom":       nom,
