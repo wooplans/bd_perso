@@ -203,23 +203,29 @@ def trouver_police_repo(nom_span):
         pass
     return None
 
-def extraire_polices_pdf(doc):
+def extraire_polices_pdf(doc, skip_page0=False):
     cache = {}
+    seen_xrefs = set()
     try:
-        fonts = doc.get_page_fonts(0, full=True)
-        for f in fonts:
-            xref     = f[0]
-            nom_full = f[3]
-            nom_clean = nom_full.split("+")[-1].lower()
-            if nom_clean in cache:
-                continue
-            font_data = doc.extract_font(xref)
-            data = font_data[3]
-            if data and len(data) > 500:
-                chemin = f"/tmp/police_{nom_clean}_{uuid.uuid4().hex[:6]}.ttf"
-                with open(chemin, "wb") as out:
-                    out.write(data)
-                cache[nom_clean] = chemin
+        start = 1 if skip_page0 else 0
+        for page_num in range(start, len(doc)):
+            fonts = doc.get_page_fonts(page_num, full=True)
+            for f in fonts:
+                xref = f[0]
+                if xref in seen_xrefs:
+                    continue
+                seen_xrefs.add(xref)
+                nom_full = f[3]
+                nom_clean = nom_full.split("+")[-1].lower()
+                if nom_clean in cache:
+                    continue
+                font_data = doc.extract_font(xref)
+                data = font_data[3]
+                if data and len(data) > 500:
+                    chemin = f"/tmp/police_{nom_clean}_{uuid.uuid4().hex[:6]}.ttf"
+                    with open(chemin, "wb") as out:
+                        out.write(data)
+                    cache[nom_clean] = chemin
     except Exception:
         pass
     return cache
@@ -271,13 +277,15 @@ def mesurer_texte(texte, fontfile, fontsize):
     return len(texte) * fontsize * 0.55, fontsize * 0.75, fontsize * 0.2
 
 
-def personnaliser_pdf_pages(chemin_pdf, prenom_ancien, prenom_nouveau):
+def personnaliser_pdf_pages(chemin_pdf, prenom_ancien, prenom_nouveau, skip_page0=False):
     doc = fitz.open(chemin_pdf)
-    cache_polices = extraire_polices_pdf(doc)
+    cache_polices = extraire_polices_pdf(doc, skip_page0=skip_page0)
     total = 0
     prenom_up = prenom_ancien.upper()
 
-    for page in doc:
+    for page_idx, page in enumerate(doc):
+        if skip_page0 and page_idx == 0:
+            continue
         page_largeur = page.rect.width
         blocs = page.get_text("dict")["blocks"]
 
@@ -1187,6 +1195,9 @@ def _stream_generer(bd_id, prenom_nouveau, compression, chemin_couverture=None):
         if data: payload.update(data)
         return "data: " + _json.dumps(payload, ensure_ascii=False) + "\n\n"
 
+    a_couverture_custom = chemin_couverture is not None
+    copie_bd = None
+
     meta = lire_meta()
     if bd_id not in meta:
         yield evt(0, "Erreur", {"erreur": "BD introuvable"})
@@ -1201,57 +1212,62 @@ def _stream_generer(bd_id, prenom_nouveau, compression, chemin_couverture=None):
         yield evt(0, "Erreur", {"erreur": f"Fichier BD introuvable. Vérifiez le lien Drive."})
         return
 
-    if chemin_couverture:
-        yield evt(10, "🖼️ Remplacement de la couverture…")
+    try:
+        if chemin_couverture:
+            yield evt(10, "🖼️ Remplacement de la couverture…")
+            try:
+                copie_bd = os.path.join(OUTPUT_FOLDER, f"tmp_{uuid.uuid4().hex[:8]}.pdf")
+                import shutil
+                shutil.copy2(chemin_bd, copie_bd)
+                _remplacer_couverture(copie_bd, chemin_couverture)
+                chemin_bd = copie_bd
+            except Exception as e:
+                yield evt(0, "Erreur", {"erreur": f"Erreur couverture : {str(e)}"})
+                return
+            finally:
+                if os.path.exists(chemin_couverture):
+                    os.remove(chemin_couverture)
+
+        docs_a_assembler = []
+        yield evt(15, "📄 Fichier BD chargé…")
+
+        yield evt(35, f"📝 Remplacement de « {prenom_ancien} » par « {prenom_nouveau} »…")
         try:
-            copie_bd = os.path.join(OUTPUT_FOLDER, f"tmp_{uuid.uuid4().hex[:8]}.pdf")
-            import shutil
-            shutil.copy2(chemin_bd, copie_bd)
-            _remplacer_couverture(copie_bd, chemin_couverture)
-            chemin_bd = copie_bd
+            doc_bd, nb = personnaliser_pdf_pages(chemin_bd, prenom_ancien, prenom_nouveau, skip_page0=a_couverture_custom)
+            docs_a_assembler.append(doc_bd)
         except Exception as e:
-            yield evt(0, "Erreur", {"erreur": f"Erreur couverture : {str(e)}"})
+            yield evt(0, "Erreur", {"erreur": f"Erreur BD : {str(e)}"})
             return
-        finally:
-            if os.path.exists(chemin_couverture):
-                os.remove(chemin_couverture)
 
-    docs_a_assembler = []
-    yield evt(15, "📄 Fichier BD chargé…")
+        if nb == 0:
+            yield evt(0, "Erreur", {"erreur": f"'{prenom_ancien}' introuvable dans le PDF"})
+            return
 
-    yield evt(35, f"📝 Remplacement de « {prenom_ancien} » par « {prenom_nouveau} »…")
-    try:
-        doc_bd, nb = personnaliser_pdf_pages(chemin_bd, prenom_ancien, prenom_nouveau)
-        docs_a_assembler.append(doc_bd)
-    except Exception as e:
-        yield evt(0, "Erreur", {"erreur": f"Erreur BD : {str(e)}"})
-        return
+        yield evt(65, f"✅ {nb} occurrence(s) remplacée(s) dans la BD")
 
-    if nb == 0:
-        yield evt(0, "Erreur", {"erreur": f"'{prenom_ancien}' introuvable dans le PDF"})
-        return
+        yield evt(70, "📎 Assemblage du PDF…")
+        try:
+            chemin_final = assembler_pdf(docs_a_assembler, prenom_nouveau, compression)
+        except Exception as e:
+            yield evt(0, "Erreur", {"erreur": f"Erreur assemblage : {str(e)}"})
+            return
 
-    yield evt(65, f"✅ {nb} occurrence(s) remplacée(s) dans la BD")
+        yield evt(90, f"🗜️ Compression ({compression})…")
 
-    yield evt(70, "📎 Assemblage du PDF…")
-    try:
-        chemin_final = assembler_pdf(docs_a_assembler, prenom_nouveau, compression)
-    except Exception as e:
-        yield evt(0, "Erreur", {"erreur": f"Erreur assemblage : {str(e)}"})
-        return
+        taille_mo = round(os.path.getsize(chemin_final) / (1024*1024), 1)
+        with fitz.open(chemin_final) as tmp_doc:
+            nb_pages = len(tmp_doc)
 
-    yield evt(90, f"🗜️ Compression ({compression})…")
-
-    taille_mo = round(os.path.getsize(chemin_final) / (1024*1024), 1)
-    with fitz.open(chemin_final) as tmp_doc:
-        nb_pages = len(tmp_doc)
-
-    yield evt(100, f"🎉 PDF prêt — {nb_pages} pages, {taille_mo} Mo", {
-        "succes":    True,
-        "fichier":   os.path.basename(chemin_final),
-        "taille_mo": taille_mo,
-        "pages":     nb_pages,
-    })
+        yield evt(100, f"🎉 PDF prêt — {nb_pages} pages, {taille_mo} Mo", {
+            "succes":    True,
+            "fichier":   os.path.basename(chemin_final),
+            "taille_mo": taille_mo,
+            "pages":     nb_pages,
+        })
+    finally:
+        if copie_bd and os.path.exists(copie_bd):
+            try: os.remove(copie_bd)
+            except: pass
 
 
 @app.route("/generer", methods=["POST"])
