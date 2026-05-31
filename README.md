@@ -2,7 +2,7 @@
 title: BD Personnalisée
 emoji: 📚
 colorFrom: purple
-colorTo: orange
+colorTo: pink
 sdk: docker
 app_port: 7860
 ---
