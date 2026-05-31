@@ -245,188 +245,186 @@ def adapter_casse(prenom_nouveau, texte, prenom_ancien):
         return prenom_nouveau.lower()
     return re.compile(re.escape(prenom_ancien), re.IGNORECASE).sub(remplacer, texte)
 
-def est_bloc_centre(bloc, page_largeur=595.0, tol_multi=3.0, tol_page=5.0):
-    centres = []
-    for line in bloc["lines"]:
-        for span in line["spans"]:
-            if span["text"].strip():
-                bbox = span["bbox"]
-                centres.append((bbox[0] + bbox[2]) / 2)
-
-    if not centres:
-        return False, 0
-
-    if len(centres) >= 2:
-        ref = centres[0]
-        if all(abs(c - ref) <= tol_multi for c in centres):
-            return True, ref
-        return False, 0
-
-    centre_page = page_largeur / 2
-    if abs(centres[0] - centre_page) <= tol_page:
-        return True, centre_page
-
-    return False, 0
-
-def zone_effacement(page, span, police, taille):
-    try:
-        import numpy as np, io
-        from PIL import Image
-        bbox  = span["bbox"]
-        orig  = span["origin"]
-        mat   = fitz.Matrix(4, 4)
-        scale = 4.0
-        centre_x = (bbox[0] + bbox[2]) / 2
-
-        y_scan = bbox[3] - 2
-        zone_h = fitz.Rect(0, y_scan - 0.5, page.rect.width, y_scan + 0.5)
-        pix_h  = page.get_pixmap(matrix=mat, clip=zone_h)
-        arr_h  = np.array(Image.open(io.BytesIO(pix_h.tobytes("png"))))
-        masque_h = (arr_h[:,:,0]>240)&(arr_h[:,:,1]>240)&(arr_h[:,:,2]>240)
-
-        centre_col = int(centre_x * scale)
-        x0_pdf, x1_pdf = bbox[0] - 5, bbox[2] + 5
-        in_white, seg_start = False, 0
-        for col_i in range(masque_h.shape[1]):
-            is_w = masque_h[:, col_i].any()
-            if is_w and not in_white:
-                seg_start = col_i
-                in_white  = True
-            elif not is_w and in_white:
-                if seg_start <= centre_col <= col_i and (col_i - seg_start) > 20:
-                    x0_pdf = seg_start / scale
-                    x1_pdf = col_i    / scale
-                in_white = False
-        if in_white and seg_start <= centre_col:
-            x0_pdf = seg_start       / scale
-            x1_pdf = masque_h.shape[1] / scale
-
-        marge_v = 30
-        zone_v  = fitz.Rect(
-            x0_pdf + 10, max(0, bbox[1] - marge_v),
-            x1_pdf - 10, min(page.rect.height, bbox[3] + marge_v)
-        )
-        pix_v  = page.get_pixmap(matrix=mat, clip=zone_v)
-        arr_v  = np.array(Image.open(io.BytesIO(pix_v.tobytes("png"))))
-        masque_v = (arr_v[:,:,0]>240)&(arr_v[:,:,1]>240)&(arr_v[:,:,2]>240)
-        seuil    = arr_v.shape[1] * 0.5
-        dense    = np.where(masque_v.sum(axis=1) > seuil)[0]
-
-        if len(dense) > 3:
-            y0_pdf = zone_v.y0 + dense[0]  / scale
-            y1_pdf = zone_v.y0 + dense[-1] / scale
-        else:
-            y0_pdf = orig[1] - (orig[1] - bbox[1]) * 0.85
-            y1_pdf = bbox[3]
-
-        return fitz.Rect(x0_pdf, y0_pdf, x1_pdf, y1_pdf)
-
-    except Exception:
-        orig = span["origin"]
-        _, asc, desc = mesurer_texte(span["text"], police, taille)
-        w = largeur_texte(span["text"], police, taille)
-        return fitz.Rect(orig[0]-5, orig[1]-asc, orig[0]+w+5, orig[1]+desc)
-
 
 def mesurer_texte(texte, fontfile, fontsize):
+    if not texte.strip():
+        return len(texte) * fontsize * 0.5, fontsize * 0.75, fontsize * 0.2
     doc_tmp = None
     try:
         doc_tmp = fitz.open()
-        page_tmp = doc_tmp.new_page(width=2000, height=300)
-        baseline_y = 150
-        page_tmp.insert_text((10, baseline_y), texte, fontfile=fontfile, fontsize=fontsize)
+        page_tmp = doc_tmp.new_page(width=4000, height=400)
+        page_tmp.insert_text((50, 200), texte, fontfile=fontfile, fontsize=fontsize)
         for b in page_tmp.get_text("dict")["blocks"]:
-            if b["type"] == 0:
-                for line in b["lines"]:
-                    for span in line["spans"]:
-                        t = span["text"].strip()
-                        if texte.strip() in t or t in texte.strip():
-                            bbox = span["bbox"]
-                            orig = span["origin"]
-                            largeur    = bbox[2] - bbox[0]
-                            ascendant  = orig[1] - bbox[1]
-                            descendant = bbox[3] - orig[1]
-                            return largeur, ascendant, descendant
+            if b["type"] != 0:
+                continue
+            for line in b["lines"]:
+                for span in line["spans"]:
+                    if span["text"].strip():
+                        bbox = span["bbox"]
+                        orig = span["origin"]
+                        return bbox[2] - bbox[0], orig[1] - bbox[1], bbox[3] - orig[1]
     except Exception:
         pass
     finally:
         if doc_tmp:
             doc_tmp.close()
-    return len(texte) * fontsize * 0.6, fontsize * 0.75, fontsize * 0.2
+    return len(texte) * fontsize * 0.55, fontsize * 0.75, fontsize * 0.2
 
-def largeur_texte(texte, fontfile, fontsize):
-    return mesurer_texte(texte, fontfile, fontsize)[0]
 
 def personnaliser_pdf_pages(chemin_pdf, prenom_ancien, prenom_nouveau):
     doc = fitz.open(chemin_pdf)
     cache_polices = extraire_polices_pdf(doc)
     total = 0
+    prenom_up = prenom_ancien.upper()
 
     for page in doc:
+        page_largeur = page.rect.width
+        blocs = page.get_text("dict")["blocks"]
 
-        lignes_a_reecrire = []
-        for bloc in page.get_text("dict")["blocks"]:
-            if bloc["type"] != 0: continue
+        lignes_a_traiter = []
+
+        for bloc in blocs:
+            if bloc["type"] != 0:
+                continue
             for line in bloc["lines"]:
-                if not any(prenom_ancien.upper() in span["text"].upper()
-                           for span in line["spans"]):
+                texte_ligne = "".join(s["text"] for s in line["spans"])
+                if prenom_up not in texte_ligne.upper():
                     continue
-                centre, centre_x = est_bloc_centre(bloc, page.rect.width)
-                lignes_a_reecrire.append({
-                    "spans":    line["spans"],
-                    "centre":   centre,
-                    "centre_x": centre_x,
+
+                spans_info = []
+                for span in line["spans"]:
+                    spans_info.append({
+                        "text":     span["text"],
+                        "font":     span["font"],
+                        "size":     span["size"],
+                        "color":    span.get("color", 0),
+                        "origin":   span["origin"],
+                        "bbox":     span["bbox"],
+                        "flags":    span.get("flags", 0),
+                    })
+
+                ligne_bbox = fitz.Rect(
+                    min(s["bbox"][0] for s in spans_info),
+                    min(s["bbox"][1] for s in spans_info),
+                    max(s["bbox"][2] for s in spans_info),
+                    max(s["bbox"][3] for s in spans_info),
+                )
+
+                centres = [(s["bbox"][0] + s["bbox"][2]) / 2 for s in spans_info if s["text"].strip()]
+                est_centre = False
+                centre_ref = 0
+                if len(centres) >= 2:
+                    ref = centres[0]
+                    if all(abs(c - ref) <= 3.0 for c in centres):
+                        est_centre = True
+                        centre_ref = ref
+                elif len(centres) == 1:
+                    if abs(centres[0] - page_largeur / 2) <= 8.0:
+                        est_centre = True
+                        centre_ref = page_largeur / 2
+
+                lignes_a_traiter.append({
+                    "spans":      spans_info,
+                    "bbox":       ligne_bbox,
+                    "est_centre": est_centre,
+                    "centre_ref": centre_ref,
                 })
 
-        for info in lignes_a_reecrire:
-            for span in info["spans"]:
-                police_span = police_pour_span(span, cache_polices)
-                zone = zone_effacement(page, span, police_span, span["size"])
-                page.add_redact_annot(zone, fill=(1, 1, 1))
-        page.apply_redactions()
+        if not lignes_a_traiter:
+            continue
 
-        for info in lignes_a_reecrire:
-            spans     = info["spans"]
-            prenom_up = prenom_ancien.upper()
+        for info in lignes_a_traiter:
+            bbox = info["bbox"]
+            marge_x = 1.0
+            marge_y = 0.5
+            zone = fitz.Rect(
+                bbox.x0 - marge_x,
+                bbox.y0 - marge_y,
+                bbox.x1 + marge_x,
+                bbox.y1 + marge_y,
+            )
+            page.add_redact_annot(zone, fill=(1, 1, 1))
+        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
 
-            delta_x = 0.0
-            for span in spans:
-                if prenom_up in span["text"].upper():
-                    police  = police_pour_span(span, cache_polices)
-                    taille  = span["size"]
-                    texte_n = adapter_casse(prenom_nouveau, span["text"], prenom_ancien)
-                    w_ancien, _, _ = mesurer_texte(span["text"], police, taille)
-                    w_nouveau, _, _ = mesurer_texte(texte_n, police, taille)
-                    delta_x = w_nouveau - w_ancien
-                    break
+        for info in lignes_a_traiter:
+            spans = info["spans"]
 
-            prenom_vu = False
-            for span in spans:
-                texte_nouveau = adapter_casse(prenom_nouveau, span["text"], prenom_ancien)
-                police     = police_pour_span(span, cache_polices)
-                taille     = span["size"]
-                baseline_y = span["origin"][1]
-                contient   = prenom_up in span["text"].upper()
+            nouveaux_spans = []
+            for s in spans:
+                nouveau_texte = adapter_casse(prenom_nouveau, s["text"], prenom_ancien)
+                police = police_pour_span(s, cache_polices)
+                nouveaux_spans.append({
+                    "text":    nouveau_texte,
+                    "police":  police,
+                    "size":    s["size"],
+                    "color":   s["color"],
+                    "origin":  s["origin"],
+                    "bbox":    s["bbox"],
+                    "ancien":  s["text"],
+                })
 
-                if info["centre"] and contient:
-                    w_n, _, _ = mesurer_texte(texte_nouveau, police, taille)
-                    x_depart = info["centre_x"] - w_n / 2
-                elif contient:
-                    x_depart = span["origin"][0]
-                    prenom_vu = True
-                elif prenom_vu and delta_x != 0.0:
-                    x_depart = span["origin"][0] + delta_x
-                else:
-                    x_depart = span["origin"][0]
+            if info["est_centre"]:
+                largeur_totale = 0
+                for ns in nouveaux_spans:
+                    w, _, _ = mesurer_texte(ns["text"], ns["police"], ns["size"])
+                    ns["largeur"] = w
+                    largeur_totale += w
 
-                page.insert_text(
-                    (x_depart, baseline_y),
-                    texte_nouveau,
-                    fontfile=police,
-                    fontsize=taille,
-                    color=(0, 0, 0)
-                )
-                total += 1
+                x_cursor = info["centre_ref"] - largeur_totale / 2
+                for ns in nouveaux_spans:
+                    baseline_y = ns["origin"][1]
+                    couleur = ns["color"]
+                    if isinstance(couleur, int):
+                        r = ((couleur >> 16) & 0xFF) / 255.0
+                        g = ((couleur >> 8) & 0xFF) / 255.0
+                        b = (couleur & 0xFF) / 255.0
+                        couleur = (r, g, b)
+                    page.insert_text(
+                        (x_cursor, baseline_y),
+                        ns["text"],
+                        fontfile=ns["police"],
+                        fontsize=ns["size"],
+                        color=couleur,
+                    )
+                    x_cursor += ns["largeur"]
+                    total += 1
+            else:
+                delta_x = 0.0
+                for ns in nouveaux_spans:
+                    if prenom_up in ns["ancien"].upper():
+                        w_ancien, _, _ = mesurer_texte(ns["ancien"], ns["police"], ns["size"])
+                        w_nouveau, _, _ = mesurer_texte(ns["text"], ns["police"], ns["size"])
+                        delta_x = w_nouveau - w_ancien
+                        break
+
+                prenom_vu = False
+                for ns in nouveaux_spans:
+                    baseline_y = ns["origin"][1]
+                    contient = prenom_up in ns["ancien"].upper()
+
+                    if contient:
+                        x_pos = ns["origin"][0]
+                        prenom_vu = True
+                    elif prenom_vu:
+                        x_pos = ns["origin"][0] + delta_x
+                    else:
+                        x_pos = ns["origin"][0]
+
+                    couleur = ns["color"]
+                    if isinstance(couleur, int):
+                        r = ((couleur >> 16) & 0xFF) / 255.0
+                        g = ((couleur >> 8) & 0xFF) / 255.0
+                        b = (couleur & 0xFF) / 255.0
+                        couleur = (r, g, b)
+
+                    page.insert_text(
+                        (x_pos, baseline_y),
+                        ns["text"],
+                        fontfile=ns["police"],
+                        fontsize=ns["size"],
+                        color=couleur,
+                    )
+                    total += 1
 
     return doc, total
 
