@@ -617,10 +617,6 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 .progress-wrap{border-radius:10px;overflow:hidden;background:rgba(108,60,225,.08);height:8px;position:relative}
 .progress-bar{height:100%;background:linear-gradient(90deg,var(--violet),var(--vert));width:0%;transition:width .3s;border-radius:10px}
 .progress-label{font-size:.75rem;font-weight:700;color:var(--doux);text-align:center;margin-top:6px}
-.btn-whatsapp{display:inline-flex;align-items:center;gap:8px;padding:11px 22px;border-radius:11px;background:#25D366;color:#fff;font-family:'Fredoka One',cursive;font-size:.9rem;text-decoration:none;transition:all .2s;box-shadow:0 3px 0 rgba(37,211,102,.3);margin-bottom:10px}
-.btn-whatsapp:hover{transform:translateY(-2px);box-shadow:0 5px 12px rgba(37,211,102,.25)}
-.commande-section{text-align:center;padding:18px 0 8px}
-.commande-label{font-size:.78rem;font-weight:700;color:var(--doux);margin-bottom:8px}
 .footer{text-align:center;font-size:.72rem;color:var(--doux);opacity:.5;font-weight:600}
 .version-badge{display:inline-block;margin-top:6px;font-size:.7rem;font-weight:800;color:var(--doux);opacity:.5;background:rgba(108,60,225,.08);padding:2px 10px;border-radius:20px;letter-spacing:.5px}
 </style>
@@ -753,10 +749,6 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
     </div>
   </div>
 
-  <div class="commande-section">
-    <div class="commande-label">Commander une BD personnalisée</div>
-    <a class="btn-whatsapp" href="https://wa.me/237691001580?text=Bonjour%2C%20je%20souhaite%20commander%20une%20BD%20personnalis%C3%A9e%20!" target="_blank">📲 WhatsApp · +237 691 001 580</a>
-  </div>
   <div class="footer">EnfantProdige · Académie des Génies · Yaoundé</div>
 </div>
 
