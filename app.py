@@ -1096,8 +1096,10 @@ def index():
     return HTML
 
 def _remplacer_couverture(chemin_bd, chemin_couverture):
+    print(f"🖼️ Couverture: ouverture BD={chemin_bd}, couv={chemin_couverture}")
     doc_bd = fitz.open(chemin_bd)
     doc_couv = fitz.open(chemin_couverture)
+    print(f"🖼️ Couverture: BD={len(doc_bd)} pages, couv={len(doc_couv)} pages")
     if len(doc_couv) == 0:
         doc_couv.close()
         doc_bd.close()
@@ -1107,6 +1109,7 @@ def _remplacer_couverture(chemin_bd, chemin_couverture):
     doc_bd.save(chemin_bd, incremental=False, encryption=fitz.PDF_ENCRYPT_NONE)
     doc_bd.close()
     doc_couv.close()
+    print(f"✅ Couverture remplacée avec succès")
 
 
 @app.route("/ajouter-bd", methods=["POST"])
@@ -1220,8 +1223,11 @@ def _stream_generer(bd_id, prenom_nouveau, compression, chemin_couverture=None):
 
     yield evt(70, "📎 Assemblage du PDF…")
     try:
+        print(f"📎 Assemblage: {len(docs_a_assembler)} doc(s), compression={compression}")
         chemin_final = assembler_pdf(docs_a_assembler, prenom_nouveau, compression)
+        print(f"✅ Assemblage OK → {chemin_final}")
     except Exception as e:
+        print(f"❌ Erreur assemblage : {e}")
         yield evt(0, "Erreur", {"erreur": f"Erreur assemblage : {str(e)}"})
         return
 
@@ -1230,24 +1236,32 @@ def _stream_generer(bd_id, prenom_nouveau, compression, chemin_couverture=None):
         try:
             _remplacer_couverture(chemin_final, chemin_couverture)
         except Exception as e:
+            print(f"❌ Erreur couverture : {e}")
             yield evt(0, "Erreur", {"erreur": f"Erreur couverture : {str(e)}"})
             return
         finally:
-            if os.path.exists(chemin_couverture):
-                os.remove(chemin_couverture)
+            try:
+                if chemin_couverture and os.path.exists(chemin_couverture):
+                    os.remove(chemin_couverture)
+            except: pass
 
-    yield evt(90, f"🗜️ Compression ({compression})…")
+    try:
+        yield evt(90, "📐 Finalisation…")
 
-    taille_mo = round(os.path.getsize(chemin_final) / (1024*1024), 1)
-    with fitz.open(chemin_final) as tmp_doc:
-        nb_pages = len(tmp_doc)
+        taille_mo = round(os.path.getsize(chemin_final) / (1024*1024), 1)
+        with fitz.open(chemin_final) as tmp_doc:
+            nb_pages = len(tmp_doc)
 
-    yield evt(100, f"🎉 PDF prêt — {nb_pages} pages, {taille_mo} Mo", {
-        "succes":    True,
-        "fichier":   os.path.basename(chemin_final),
-        "taille_mo": taille_mo,
-        "pages":     nb_pages,
-    })
+        yield evt(100, f"🎉 PDF prêt — {nb_pages} pages, {taille_mo} Mo", {
+            "succes":    True,
+            "fichier":   os.path.basename(chemin_final),
+            "taille_mo": taille_mo,
+            "pages":     nb_pages,
+        })
+    except Exception as e:
+        print(f"❌ Erreur finalisation : {e}")
+        yield evt(0, "Erreur", {"erreur": f"Erreur finalisation : {str(e)}"})
+        return
 
 
 @app.route("/generer", methods=["POST"])
